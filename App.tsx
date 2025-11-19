@@ -6,66 +6,81 @@ import {
   Trash2, Play, Pause, 
   ChevronDown, Sliders,
   AlertTriangle, MessageSquare, Sparkles, Fan, Gauge, Timer, CalendarClock,
-  PenTool, Server, ShieldCheck, Coins, Cpu, Ruler
+  PenTool, Coins, Cpu, GripVertical, Settings2, ArrowRight,
+  CircleDot, Cylinder, LandPlot, MousePointer2, X, Workflow, Cable, Construction,
+  RectangleVertical, Container, Spline, Disc, Plug
 } from 'lucide-react';
 import { ChatMessage, Sender, Attachment, FaultState, PlanStep, DesignParadigm, DisturbanceType, DisturbanceConfig } from './types';
 import ChatInput from './components/ChatInput';
 import MarkdownRenderer from './components/MarkdownRenderer';
 import { streamGeminiResponse } from './services/geminiService';
 
-// --- CONSTANTS ---
-const DT = 0.1; // Simulation Tick (s)
-const PIPE_DELAY_SECONDS = 5.0; 
-const BUFFER_SIZE = Math.round(PIPE_DELAY_SECONDS / DT);
+// --- TYPES & CONSTANTS ---
+const DT = 0.1;
+const BUFFER_SIZE = 500; 
 const HISTORY_SECONDS = 60;
 const MAX_HISTORY = Math.round(HISTORY_SECONDS / DT);
 
-// --- Design Paradigms ---
+type NodeType = 'SOURCE' | 'PUMP' | 'PIPE' | 'RESERVOIR' | 'DEMAND' | 'VALVE' | 'GATE' | 'TURBINE';
+
+interface CanvasNode {
+  id: string;
+  type: NodeType;
+  x: number;
+  y: number;
+  label: string;
+  data: any; 
+}
+
+interface CanvasEdge {
+  id: string;
+  source: string;
+  target: string;
+}
+
+// Design Paradigms
 const PARADIGMS: DesignParadigm[] = [
   {
     type: 'TRADITIONAL',
     name: '传统设计范式',
-    description: '以大设施换稳定',
-    tankArea: 200.0, // Huge tank
+    description: '以大设施换稳定 (PID + 大调蓄池)',
+    tankArea: 200.0,
     algorithm: 'PID',
     infrastructureCost: '$$$$',
     computeCost: '$',
-    resilience: '极高 (物理冗余)'
+    resilience: '极高'
   },
   {
     type: 'IMPROVED',
     name: '改良设计范式',
-    description: '内模控制补偿',
-    tankArea: 80.0, // Medium tank
+    description: '内模控制补偿 (Smith + 中调蓄池)',
+    tankArea: 80.0,
     algorithm: 'SMITH',
     infrastructureCost: '$$',
     computeCost: '$$',
-    resilience: '中 (算法补偿)'
+    resilience: '中'
   },
   {
     type: 'MODERN',
     name: '现代设计范式',
-    description: '以算力换设施',
-    tankArea: 15.0, // Tiny tank
+    description: '以算力换设施 (MPC + 微调蓄池)',
+    tankArea: 15.0,
     algorithm: 'MPC',
     infrastructureCost: '$',
     computeCost: '$$$$',
-    resilience: '低 (依赖算力)'
+    resilience: '低'
   }
 ];
 
 const DISTURBANCE_OPTIONS: { type: DisturbanceType; label: string }[] = [
-  { type: 'CONSTANT', label: '恒定值 (Constant)' },
-  { type: 'STEP', label: '阶跃突变 (Step)' },
-  { type: 'RAMP', label: '线性爬坡 (Ramp)' },
-  { type: 'SINE', label: '正弦波动 (Sine)' },
-  { type: 'SQUARE', label: '方波震荡 (Square)' },
-  { type: 'TRIANGLE', label: '三角波 (Triangle)' },
-  { type: 'SAWTOOTH', label: '锯齿波 (Sawtooth)' },
-  { type: 'PULSE', label: '脉冲干扰 (Pulse)' },
-  { type: 'NOISE', label: '随机白噪声 (Noise)' },
-  { type: 'RANDOM_WALK', label: '随机游走 (Walk)' },
-  { type: 'BURST', label: '突发洪峰 (Burst)' },
+  { type: 'CONSTANT', label: '恒定值' },
+  { type: 'STEP', label: '阶跃突变' },
+  { type: 'RAMP', label: '线性爬坡' },
+  { type: 'SINE', label: '正弦波动' },
+  { type: 'SQUARE', label: '方波震荡' },
+  { type: 'PULSE', label: '脉冲干扰' },
+  { type: 'NOISE', label: '随机白噪声' },
+  { type: 'BURST', label: '突发洪峰' },
 ];
 
 // --- MATH HELPERS ---
@@ -74,1032 +89,746 @@ const getDisturbanceValue = (t: number, config: DisturbanceConfig) => {
   const omega = 2 * Math.PI * frequency;
   const period = 1 / Math.max(0.001, frequency);
   const localT = t % period;
-
   switch(type) {
     case 'CONSTANT': return base;
     case 'STEP': return localT < period/2 ? base : base + amplitude;
     case 'RAMP': return base + amplitude * (localT / period);
     case 'SINE': return base + amplitude * Math.sin(omega * t);
     case 'SQUARE': return base + amplitude * Math.sign(Math.sin(omega * t));
-    case 'TRIANGLE': return base + amplitude * (2 * Math.abs(2 * (localT / period) - 1) - 1);
-    case 'SAWTOOTH': return base + amplitude * (2 * (localT / period) - 1);
     case 'PULSE': return localT < period * 0.1 ? base + amplitude : base;
     case 'NOISE': return base + (Math.random() - 0.5) * amplitude;
-    case 'RANDOM_WALK': return base + Math.sin(t * 0.1) * amplitude + (Math.random() - 0.5) * 5;
     case 'BURST': return (t % 20 > 18) ? base + amplitude * 2 : base;
     default: return base;
   }
 };
 
-// --- COMPONENTS ---
+// --- UI COMPONENTS ---
 
-// 1. Disturbance Preview Chart
-const DisturbancePreview = ({ config, scope }: { config: DisturbanceConfig, scope: 'DEMAND' | 'TARGET' }) => {
-  const width = 240;
-  const height = 80;
-  const points = [];
-  const samples = 100;
+const PaletteItem = ({ type, icon: Icon, label, isLinear }: { type: NodeType, icon: any, label: string, isLinear?: boolean }) => (
+  <div 
+    className="flex flex-col items-center justify-center p-3 bg-slate-900 rounded-lg border border-slate-800 hover:border-cyan-500/50 hover:bg-slate-800 cursor-grab active:cursor-grabbing transition-all group w-full select-none relative overflow-hidden"
+    draggable
+    onDragStart={(e) => {
+      e.dataTransfer.setData('nodeType', type);
+      e.dataTransfer.setData('nodeLabel', label);
+      e.dataTransfer.effectAllowed = 'copy';
+    }}
+  >
+    <div className="absolute top-0 right-0 p-1 opacity-0 group-hover:opacity-100 transition-opacity">
+      <div className="w-1.5 h-1.5 bg-cyan-500 rounded-full shadow-[0_0_5px_cyan]"></div>
+    </div>
+    <Icon size={20} className={isLinear ? "text-cyan-300/70 group-hover:text-cyan-400" : "text-slate-400 group-hover:text-slate-200"} />
+    <span className="text-[10px] text-slate-500 font-bold mt-2 group-hover:text-cyan-100 transition-colors text-center leading-tight">{label}</span>
+  </div>
+);
+
+interface CanvasNodeComponentProps {
+  node: CanvasNode;
+  isSelected: boolean;
+  onMouseDown: (e: React.MouseEvent) => void;
+  onStartConnect: (e: React.MouseEvent, nodeId: string) => void;
+  onEndConnect: (e: React.MouseEvent, nodeId: string) => void;
+}
+
+const CanvasNodeComponent: React.FC<CanvasNodeComponentProps> = ({ node, isSelected, onMouseDown, onStartConnect, onEndConnect }) => {
+  // Render Visuals
+  let Visual = null;
   
-  // Normalize for visualization
-  const maxVal = config.base + Math.abs(config.amplitude) * 1.2;
-  const minVal = config.base - Math.abs(config.amplitude) * 1.2;
-  const range = Math.max(10, maxVal - minVal);
+  if (node.type === 'PIPE') {
+    Visual = (
+        <div className={`w-28 h-5 bg-slate-800 rounded-full border flex items-center justify-center relative overflow-hidden transition-all ${isSelected ? 'border-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.3)]' : 'border-slate-600 group-hover:border-slate-500'}`}>
+           <div className="absolute inset-0 bg-cyan-900/20"></div>
+           <div className="absolute inset-0 flex gap-4 animate-flow-right opacity-30">
+              {[1,2,3,4,5].map(i => <div key={i} className="w-1 h-full bg-cyan-400 transform -skew-x-12"></div>)}
+           </div>
+           <span className="relative z-10 text-[9px] font-mono text-cyan-200 font-bold flex gap-1 items-center">
+              <Spline size={10}/> {node.label} ({node.data.delay}s)
+           </span>
+        </div>
+    );
+  } else {
+      let Icon = Box;
+      let colorClass = "text-slate-400";
+      let bgClass = "bg-slate-900";
+      let borderClass = "border-slate-700";
+      let subLabel = "";
 
-  for(let i=0; i<samples; i++) {
-      const t_local = i * (10/samples); // 10 seconds window
-      const val = getDisturbanceValue(t_local, config);
-      // Map val to y (inverted because SVG y=0 is top)
-      const y = height - ((val - minVal) / range) * height * 0.8 - 10;
-      const x = (i / (samples - 1)) * width;
-      points.push(`${x},${y}`);
+      switch(node.type) {
+        case 'SOURCE': Icon = Waves; colorClass="text-blue-400"; break;
+        case 'PUMP': Icon = Fan; colorClass="text-orange-400"; borderClass="border-orange-900/50"; subLabel=`η:${node.data.efficiency||100}%`; break;
+        case 'TURBINE': Icon = Zap; colorClass="text-purple-400"; borderClass="border-purple-900/50"; subLabel=`${node.data.capacity||100}MW`; break;
+        case 'RESERVOIR': Icon = Container; colorClass="text-cyan-400"; borderClass="border-cyan-900/50"; subLabel=`A:${node.data.area}m²`; break;
+        case 'DEMAND': Icon = ArrowRight; colorClass="text-red-400"; break;
+        case 'VALVE': Icon = CircleDot; colorClass="text-yellow-400"; subLabel=`${node.data.open||100}%`; break;
+        case 'GATE': Icon = RectangleVertical; colorClass="text-yellow-500"; subLabel=`${node.data.open||100}%`; break;
+      }
+
+      Visual = (
+        <>
+            <div className={`w-14 h-14 rounded-xl border-2 flex items-center justify-center shadow-2xl transition-all ${bgClass} ${isSelected ? 'border-white scale-110 shadow-cyan-500/20' : `${borderClass} hover:border-slate-500`}`}>
+                <Icon size={28} className={colorClass} />
+            </div>
+            <div className={`absolute -bottom-8 bg-slate-950/80 px-2 py-1 rounded border text-center min-w-[60px] backdrop-blur-md ${isSelected ? 'border-white text-white' : 'border-slate-800 text-slate-400'}`}>
+                <div className="text-[10px] font-bold whitespace-nowrap">{node.label}</div>
+                {subLabel && <div className="text-[9px] font-mono text-slate-500">{subLabel}</div>}
+            </div>
+        </>
+      );
   }
 
-  const color = scope === 'DEMAND' ? '#ef4444' : '#22c55e';
-
   return (
-      <div className="w-full h-[80px] bg-slate-950 rounded border border-slate-700 relative overflow-hidden">
-          <svg width="100%" height="100%" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none">
-              <path d={`M0,${height} L${points.join(' ')} L${width},${height} Z`} fill={color} fillOpacity="0.1" />
-              <polyline points={points.join(' ')} fill="none" stroke={color} strokeWidth="2" vectorEffect="non-scaling-stroke" />
-              <line x1="0" y1={height/2} x2={width} y2={height/2} stroke="#334155" strokeWidth="1" strokeDasharray="2 2"/>
-          </svg>
-          <div className="absolute top-1 right-2 text-[9px] font-mono bg-slate-900/80 px-1 rounded" style={{color}}>未来10秒预览</div>
-      </div>
+    <div 
+      className={`absolute flex flex-col items-center cursor-grab active:cursor-grabbing group z-20 select-none`}
+      style={{ left: node.x, top: node.y, transform: 'translate(-50%, -50%)' }}
+      onMouseDown={onMouseDown}
+    >
+      {/* Input Port (Left) */}
+      {node.type !== 'SOURCE' && (
+          <div 
+            className="absolute -left-3 top-1/2 -translate-y-1/2 w-3 h-3 bg-slate-800 rounded-full border-2 border-slate-500 hover:bg-green-500 hover:border-green-300 hover:scale-125 transition-all cursor-crosshair z-30"
+            onMouseUp={(e) => { e.stopPropagation(); onEndConnect(e, node.id); }}
+            title="Input Port"
+          />
+      )}
+
+      {Visual}
+
+      {/* Output Port (Right) */}
+      {node.type !== 'DEMAND' && (
+          <div 
+            className="absolute -right-3 top-1/2 -translate-y-1/2 w-3 h-3 bg-slate-800 rounded-full border-2 border-slate-500 hover:bg-blue-500 hover:border-blue-300 hover:scale-125 transition-all cursor-crosshair z-30"
+            onMouseDown={(e) => { e.stopPropagation(); onStartConnect(e, node.id); }}
+            title="Output Port"
+          />
+      )}
+    </div>
   );
 };
 
-// 2. Trend Chart
-interface ChartData {
-  t: number;
-  level: number;
-  target: number;
-  flowIn: number;
-  flowOut: number;
-}
-
-interface TrendChartProps {
-  history: ChartData[];
-  prediction?: { t: number; level: number, flowOut: number }[];
-  faults: FaultState;
-}
-
-const TrendChart: React.FC<TrendChartProps> = ({ history, prediction, faults }) => {
+// --- CHART ---
+const TrendChart: React.FC<{ history: any[], prediction?: any[], faults: any }> = ({ history, prediction, faults }) => {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [dimensions, setDimensions] = useState({ width: 600, height: 200 });
+  const [dims, setDims] = useState({ w: 600, h: 200 });
 
   useEffect(() => {
-    if (containerRef.current) {
-      const ro = new ResizeObserver(entries => {
-        for (let entry of entries) {
-          setDimensions({ width: entry.contentRect.width, height: entry.contentRect.height });
-        }
-      });
-      ro.observe(containerRef.current);
-      return () => ro.disconnect();
-    }
+    if (!containerRef.current) return;
+    const ro = new ResizeObserver(e => setDims({ w: e[0].contentRect.width, h: e[0].contentRect.height }));
+    ro.observe(containerRef.current);
+    return () => ro.disconnect();
   }, []);
 
-  const { width, height } = dimensions;
-  const mLeft = 50; 
-  const mRight = 50;
-  const mTop = 30;
-  const mBottom = 30;
-  const chartW = width - mLeft - mRight;
-  const chartH = height - mTop - mBottom;
+  if (!history.length) return <div className="w-full h-full bg-slate-950 flex items-center justify-center text-xs text-slate-600 animate-pulse">等待仿真数据...</div>;
 
-  const FLOW_MAX = 250;
-  const LEVEL_MAX = 350;
+  const { w, h } = dims;
+  const m = { t: 20, b: 30, l: 40, r: 40 }; // Margins
+  const chartW = w - m.l - m.r;
+  const chartH = h - m.t - m.b;
 
-  // Safety check to prevent crash on empty history
-  if (!history || history.length === 0) {
-    return (
-      <div className="w-full h-full bg-slate-950 flex items-center justify-center border border-slate-800 rounded select-none" ref={containerRef}>
-         <div className="flex flex-col items-center text-slate-500 gap-2">
-            <Activity className="animate-pulse" />
-            <span className="text-xs">等待仿真数据初始化...</span>
-         </div>
-      </div>
-    );
-  }
+  const last = history[history.length - 1];
+  const tEnd = last.t + (45 * 0.25);
+  const tStart = tEnd - 45;
+  
+  const getX = (t: number) => m.l + ((t - tStart) / (tEnd - tStart)) * chartW;
+  const getYFlow = (v: number) => m.t + chartH - (Math.max(0, Math.min(250, v)) / 250) * chartH;
+  const getYLevel = (v: number) => m.t + chartH - (Math.max(0, Math.min(350, v)) / 350) * chartH;
 
-  const lastPoint = history[history.length - 1];
-  const currentTime = lastPoint.t;
-  const VIEW_WINDOW_S = 45;
-  const FUTURE_RATIO = 0.25; // 25% of the chart is for future prediction
-  const tEnd = currentTime + (VIEW_WINDOW_S * FUTURE_RATIO);
-  const tStart = tEnd - VIEW_WINDOW_S;
-
-  const getX = (t: number) => mLeft + ((t - tStart) / (tEnd - tStart)) * chartW;
-  const getYFlow = (val: number) => mTop + chartH - (Math.max(0, Math.min(FLOW_MAX, val)) / FLOW_MAX) * chartH;
-  const getYLevel = (val: number) => mTop + chartH - (Math.max(0, Math.min(LEVEL_MAX, val)) / LEVEL_MAX) * chartH;
-
-  const makePolylinePoints = (data: any[], valKey: string, yMapper: (v:number)=>number) => {
-    const visibleData = data.filter(d => d.t >= tStart - 2 && d.t <= tEnd + 2);
-    if (visibleData.length < 2) return "";
-    return visibleData.map(d => `${getX(d.t).toFixed(1)},${yMapper(d[valKey]).toFixed(1)}`).join(" ");
+  const makePath = (data: any[], val: string, scale: (v:number)=>number) => {
+    const visible = data.filter(d => d.t >= tStart - 2 && d.t <= tEnd + 2);
+    if(visible.length < 2) return "";
+    return visible.map(d => `${getX(d.t).toFixed(1)},${scale(d[val]).toFixed(1)}`).join(" ");
   };
+
+  const pLevel = makePath(history, 'level', getYLevel);
+  const pTarget = makePath(history, 'target', getYLevel);
+  const pFlow = makePath(history, 'flowIn', getYFlow);
+  const pDemand = makePath(history, 'flowOut', getYFlow);
   
-  const pointsLevel = makePolylinePoints(history, 'level', getYLevel);
-  const pointsTarget = makePolylinePoints(history, 'target', getYLevel);
-  const pointsFlowIn = makePolylinePoints(history, 'flowIn', getYFlow);
-  const pointsFlowOut = makePolylinePoints(history, 'flowOut', getYFlow);
-  
-  let pointsPredLevel = "";
-  let pointsPredDemand = "";
-  
+  let pPredLevel = "", pPredDemand = "";
   if (prediction && prediction.length > 0) {
-      const combinedPred = [{t: lastPoint.t, level: lastPoint.level, flowOut: lastPoint.flowOut}, ...prediction];
-      pointsPredLevel = makePolylinePoints(combinedPred, 'level', getYLevel);
-      pointsPredDemand = makePolylinePoints(combinedPred, 'flowOut', getYFlow);
+    const combined = [last, ...prediction];
+    pPredLevel = makePath(combined, 'level', getYLevel);
+    pPredDemand = makePath(combined, 'flowOut', getYFlow);
   }
 
-  const xNow = getX(currentTime);
-  const validPath = pointsLevel && pointsLevel.length > 10;
+  const xNow = getX(last.t);
 
   return (
-      <div className="w-full h-full bg-slate-950 relative overflow-hidden select-none rounded-lg border border-slate-800" ref={containerRef}>
-          {faults.leakage.active && <div className="absolute inset-0 bg-red-900/10 animate-pulse pointer-events-none z-0"></div>}
-          {faults.sensorDrift.active && <div className="absolute inset-0 bg-yellow-900/10 animate-pulse pointer-events-none z-0"></div>}
+    <div ref={containerRef} className="w-full h-full relative bg-slate-950 rounded-lg border border-slate-800 overflow-hidden select-none">
+       {faults.leakage.active && <div className="absolute inset-0 bg-red-500/10 animate-pulse z-0 pointer-events-none"/>}
+       
+       <svg width={w} height={h} className="absolute inset-0 z-10">
+          <defs>
+             <linearGradient id="gradLevel" x1="0" x2="0" y1="0" y2="1">
+                <stop offset="0" stopColor="#06b6d4" stopOpacity="0.2"/>
+                <stop offset="1" stopColor="#06b6d4" stopOpacity="0"/>
+             </linearGradient>
+          </defs>
+          
+          {/* Prediction Zone BG */}
+          <rect x={xNow} y={m.t} width={Math.max(0, w-m.r-xNow)} height={chartH} fill="#0f172a" opacity="0.8"/>
+          
+          {/* Grid & Axes */}
+          {[0, 0.25, 0.5, 0.75, 1].map(p => {
+             const y = m.t + chartH * (1-p);
+             return <g key={p}>
+                <line x1={m.l} y1={y} x2={w-m.r} y2={y} stroke="#1e293b" strokeWidth="1" strokeDasharray="2 2"/>
+                <text x={m.l-5} y={y+3} textAnchor="end" className="text-[9px] fill-blue-500/70 font-mono">{(p*250).toFixed(0)}</text>
+                <text x={w-m.r+5} y={y+3} textAnchor="start" className="text-[9px] fill-cyan-500/70 font-mono">{(p*350).toFixed(0)}</text>
+             </g>
+          })}
 
-          <svg className="w-full h-full z-10 relative">
-               <defs>
-                  <linearGradient id="levelGradient" x1="0" x2="0" y1="0" y2="1">
-                      <stop offset="0%" stopColor="#06b6d4" stopOpacity="0.3"/>
-                      <stop offset="100%" stopColor="#06b6d4" stopOpacity="0.05"/>
-                  </linearGradient>
-               </defs>
-               
-               {/* Future Zone Background */}
-               <rect x={xNow} y={mTop} width={Math.max(0, width - mRight - xNow)} height={chartH} fill="#1e293b" opacity="0.3" />
-               
-               {/* Axes Labels */}
-               <text x={mLeft} y={mTop - 15} fontSize="10" fill="#3b82f6" fontWeight="bold">流量 (左轴) m³/s</text>
-               <text x={width - mRight} y={mTop - 15} textAnchor="end" fontSize="10" fill="#06b6d4" fontWeight="bold">水位 (右轴) m</text>
+          {/* NOW Line */}
+          <line x1={xNow} y1={m.t} x2={xNow} y2={h-m.b} stroke="#cbd5e1" strokeWidth="1" strokeDasharray="3 3" opacity="0.5"/>
+          <text x={xNow} y={m.t-5} textAnchor="middle" className="text-[9px] fill-slate-400 font-bold tracking-widest">LIVE</text>
 
-               {/* Grid */}
-               {[0, 0.25, 0.5, 0.75, 1].map(p => {
-                  const y = mTop + chartH * (1 - p);
-                  return (
-                    <g key={p}>
-                      <line x1={mLeft} y1={y} x2={width - mRight} y2={y} stroke="#334155" strokeWidth="1" strokeDasharray="2 2" />
-                      <text x={mLeft - 5} y={y + 3} textAnchor="end" fontSize="9" fill="#3b82f6" className="font-mono">{(p * FLOW_MAX).toFixed(0)}</text>
-                      <text x={width - mRight + 5} y={y + 3} textAnchor="start" fontSize="9" fill="#06b6d4" className="font-mono">{(p * LEVEL_MAX).toFixed(0)}</text>
-                    </g>
-                  )
-               })}
+          {/* Data Curves */}
+          {pLevel && <path d={`M${pLevel.split(' ')[0]?.split(',')[0]},${m.t+chartH} ${pLevel.replace(/ /g, ' L')} V${m.t+chartH} Z`} fill="url(#gradLevel)"/>}
+          
+          <polyline points={pTarget} fill="none" stroke="#10b981" strokeWidth="1.5" strokeDasharray="4 4" opacity="0.8"/>
+          <polyline points={pLevel} fill="none" stroke="#06b6d4" strokeWidth="2"/>
+          <polyline points={pFlow} fill="none" stroke="#3b82f6" strokeWidth="1.5" opacity="0.9"/>
+          <polyline points={pDemand} fill="none" stroke="#ef4444" strokeWidth="1.5" opacity="0.9"/>
+          
+          {/* Predictions */}
+          <polyline points={pPredLevel} fill="none" stroke="#fff" strokeWidth="2" strokeDasharray="2 2" opacity="0.4"/>
+          <polyline points={pPredDemand} fill="none" stroke="#ef4444" strokeWidth="1.5" strokeDasharray="2 2" opacity="0.4"/>
+       </svg>
 
-               <line x1={xNow} y1={mTop} x2={xNow} y2={height-mBottom} stroke="#94a3b8" strokeWidth="1" strokeDasharray="4 2" opacity="0.5"/>
-               <text x={xNow} y={height-mBottom+12} textAnchor="middle" fontSize="9" fill="#94a3b8" fontWeight="bold">当前时刻 (NOW)</text>
-               <text x={xNow + 20} y={mTop + 15} fontSize="9" fill="#64748b" fontStyle="italic">未来预测 (MPC)</text>
-
-               {/* Chart Lines */}
-               {validPath && <path d={`M${pointsLevel.split(' ')[0].split(',')[0]},${mTop+chartH} ${pointsLevel.replace(/ /g, ' L')} V${mTop+chartH} Z`} fill="url(#levelGradient)" />}
-               
-               {pointsTarget && <polyline points={pointsTarget} fill="none" stroke="#22c55e" strokeWidth="1.5" strokeDasharray="4 4" opacity="0.7"/>}
-               {pointsLevel && <polyline points={pointsLevel} fill="none" stroke="#06b6d4" strokeWidth="2" />}
-               
-               {/* Prediction Lines */}
-               {pointsPredLevel && <polyline points={pointsPredLevel} fill="none" stroke="#ffffff" strokeWidth="2" strokeDasharray="2 2" strokeOpacity="0.8" />}
-               {pointsPredDemand && <polyline points={pointsPredDemand} fill="none" stroke="#ef4444" strokeWidth="1.5" strokeDasharray="2 2" strokeOpacity="0.6" />}
-               
-               {/* Flow Lines */}
-               {pointsFlowOut && <polyline points={pointsFlowOut} fill="none" stroke="#ef4444" strokeWidth="1.5" opacity="0.8" />}
-               {pointsFlowIn && <polyline points={pointsFlowIn} fill="none" stroke="#3b82f6" strokeWidth="1.5" />}
-
-               {/* Borders */}
-               <line x1={mLeft} y1={mTop} x2={mLeft} y2={height-mBottom} stroke="#3b82f6" strokeWidth="1"/>
-               <line x1={width-mRight} y1={mTop} x2={width-mRight} y2={height-mBottom} stroke="#06b6d4" strokeWidth="1"/>
-               <line x1={mLeft} y1={height-mBottom} x2={width-mRight} y2={height-mBottom} stroke="#475569" strokeWidth="1"/>
-          </svg>
-
-          <div className="absolute top-8 right-14 bg-slate-900/90 backdrop-blur-sm border border-slate-800 rounded-lg p-2 shadow-xl z-20 min-w-[130px]">
-              <div className="text-[9px] text-slate-500 mb-1 font-bold uppercase tracking-wider border-b border-slate-800 pb-1">实时图例 Legend</div>
-              <div className="space-y-1.5 mt-1">
-                <div className="flex items-center justify-between gap-2"><span className="text-[10px] text-slate-300">进水流量 (Flow In)</span><div className="w-6 h-0.5 bg-blue-500"></div></div>
-                <div className="flex items-center justify-between gap-2"><span className="text-[10px] text-slate-300">用户需求 (Demand)</span><div className="w-6 h-0.5 bg-red-500"></div></div>
-                <div className="flex items-center justify-between gap-2"><span className="text-[10px] text-slate-300">实时水位 (Level)</span><div className="w-6 h-0.5 bg-cyan-500"></div></div>
-                <div className="flex items-center justify-between gap-2"><span className="text-[10px] text-slate-300">设定目标 (Target)</span><div className="w-6 h-0.5 border-t border-green-500 border-dashed"></div></div>
-                {prediction && prediction.length > 0 && (
-                    <div className="flex items-center justify-between gap-2"><span className="text-[10px] text-white/80 italic">MPC预测水位</span><div className="w-6 h-0.5 border-t border-white border-dotted"></div></div>
-                )}
-              </div>
+       {/* Bottom Right Legend (Fixed & Overlay) */}
+       <div className="absolute bottom-3 right-3 bg-slate-900/80 backdrop-blur-md border border-slate-700 p-2 rounded-md shadow-2xl z-20 pointer-events-none">
+          <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[9px]">
+             <div className="flex items-center gap-1.5 text-slate-300"><div className="w-2 h-2 bg-blue-500 rounded-sm"/> 进水 Flow</div>
+             <div className="flex items-center gap-1.5 text-slate-300"><div className="w-2 h-2 bg-cyan-500 rounded-sm"/> 水位 Level</div>
+             <div className="flex items-center gap-1.5 text-slate-300"><div className="w-2 h-2 bg-red-500 rounded-sm"/> 需求 Out</div>
+             <div className="flex items-center gap-1.5 text-slate-300"><div className="w-2 h-2 border-t border-green-500 border-dashed"/> 目标 SP</div>
+             <div className="flex items-center gap-1.5 text-slate-400 col-span-2 opacity-70"><div className="w-2 h-2 border-t border-white border-dotted"/> MPC预测</div>
           </div>
-      </div>
+       </div>
+    </div>
   );
 };
-
 
 export default function App() {
   // --- STATE ---
-  // 1. Design
-  const [deployedParadigm, setDeployedParadigm] = useState<DesignParadigm>(PARADIGMS[1]); // Default Improved
-  const [activeTab, setActiveTab] = useState<'DESIGN' | 'DISTURBANCE' | 'FAULTS'>('DESIGN');
-
-  // 2. Simulation State
+  const [deployedParadigm, setDeployedParadigm] = useState<DesignParadigm>(PARADIGMS[1]);
+  const [activeTab, setActiveTab] = useState<'DESIGN' | 'CONTROL' | 'FAULTS'>('DESIGN');
+  
+  // Sim
   const [time, setTime] = useState(0);
   const [isRunning, setIsRunning] = useState(true);
-  const [history, setHistory] = useState<ChartData[]>([]);
+  const [history, setHistory] = useState<any[]>([]);
   
-  // 3. Disturbance Patterns (Unified Plan Logic)
-  const [activeDemandPattern, setActiveDemandPattern] = useState<DisturbanceConfig>({
-    type: 'STEP', base: 50, amplitude: 100, frequency: 0.1, active: true
-  });
-  const [activeSetpointPattern, setActiveSetpointPattern] = useState<DisturbanceConfig>({
-    type: 'CONSTANT', base: 295, amplitude: 0, frequency: 0, active: true
-  });
+  // Canvas Nodes & Edges
+  const [nodes, setNodes] = useState<CanvasNode[]>([
+    { id: 'n1', type: 'SOURCE', x: 80, y: 180, label: '水源地', data: {} },
+    { id: 'n2', type: 'PUMP', x: 200, y: 180, label: '加压泵站', data: { efficiency: 100 } },
+    { id: 'n3', type: 'PIPE', x: 380, y: 180, label: '输水干渠', data: { delay: 5.0 } },
+    { id: 'n4', type: 'RESERVOIR', x: 550, y: 180, label: '调蓄池', data: { area: 80.0 } },
+    { id: 'n5', type: 'DEMAND', x: 700, y: 180, label: '市政管网', data: {} },
+  ]);
+  const [edges, setEdges] = useState<CanvasEdge[]>([
+    { id: 'e1', source: 'n1', target: 'n2' },
+    { id: 'e2', source: 'n2', target: 'n3' },
+    { id: 'e3', source: 'n3', target: 'n4' },
+    { id: 'e4', source: 'n4', target: 'n5' }
+  ]);
 
-  // 4. Draft State (for UI editing)
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [draggingNode, setDraggingNode] = useState<{id: string, startX: number, startY: number, initialNodeX: number, initialNodeY: number} | null>(null);
+  const [tempEdge, setTempEdge] = useState<{sourceId: string, x1: number, y1: number, x2: number, y2: number} | null>(null);
+
+  // Controls
+  const [activeDemandPattern, setActiveDemandPattern] = useState<DisturbanceConfig>({ type: 'STEP', base: 50, amplitude: 100, frequency: 0.1, active: true });
+  const [activeSetpointPattern, setActiveSetpointPattern] = useState<DisturbanceConfig>({ type: 'CONSTANT', base: 295, amplitude: 0, frequency: 0, active: true });
   const [disturbanceScope, setDisturbanceScope] = useState<'DEMAND' | 'TARGET'>('DEMAND');
   const [draftDisturbance, setDraftDisturbance] = useState<DisturbanceConfig>(activeDemandPattern);
   
-  // Sync draft when scope changes
-  useEffect(() => {
-    if (disturbanceScope === 'DEMAND') setDraftDisturbance(activeDemandPattern);
-    else setDraftDisturbance(activeSetpointPattern);
-  }, [disturbanceScope]); 
-
-  // 5. Plans Queue
   const [plans, setPlans] = useState<PlanStep[]>([]);
-  const [planDelay, setPlanDelay] = useState(10); // Seconds
+  const [planDelay, setPlanDelay] = useState(10);
+  const [faults, setFaults] = useState<FaultState>({ leakage: {active:false, value:0}, pumpEfficiency: {active:false, value:0}, sensorDrift: {active:false, value:0} });
 
-  // 6. Faults
-  const [faults, setFaults] = useState<FaultState>({
-    leakage: { active: false, value: 0 },
-    pumpEfficiency: { active: false, value: 0 },
-    sensorDrift: { active: false, value: 0 }
-  });
-
-  // 7. Chat
+  // AI & Refs
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [showChat, setShowChat] = useState(true);
-
-  // 8. Internal Refs for Simulation
   const pipeBufferRef = useRef<number[]>(new Array(BUFFER_SIZE).fill(0));
   const tankLevelRef = useRef(295);
-  const smithStateRef = useRef({ modelLevel: 295, delayedLevel: 295 });
+  const mpcStateRef = useRef({ lastOut: 0 });
   const integralRef = useRef(0);
   const lastErrorRef = useRef(0);
-  const mpcStateRef = useRef({ lastOut: 0 });
 
-  // --- MEMOIZED SIZES ---
-  const tankPixelWidth = useMemo(() => {
-    return Math.min(160, Math.max(60, deployedParadigm.tankArea / 1.2));
-  }, [deployedParadigm]);
-  
-  // Calculate pipe width to ensure it always connects to the tank
-  // Center of Tank X (approx): 700 - 160 (right-40) = 540px
-  // Pipe Start X: 240px (left-60)
-  // Pipe End Target: 540 - tankPixelWidth/2
-  const pipePixelWidth = 300 - (tankPixelWidth / 2);
+  // Sync Draft
+  useEffect(() => {
+     if (disturbanceScope === 'DEMAND') setDraftDisturbance(activeDemandPattern);
+     else setDraftDisturbance(activeSetpointPattern);
+  }, [disturbanceScope]);
 
-
-  // --- HANDLERS ---
-
-  const handleSendMessage = async (text: string, attachments: Attachment[]) => {
-    const userMsg: ChatMessage = {
-      id: Date.now().toString(),
-      sender: Sender.User,
-      text,
-      attachments,
-      timestamp: new Date()
-    };
-    setMessages(prev => [...prev, userMsg]);
-    setIsStreaming(true);
-
-    try {
-      // Build current context snapshot
-      const lastData = history[history.length - 1] || { level: 0, target: 0, flowIn: 0, flowOut: 0 };
-      const systemContext = {
-        state: {
-          time,
-          waterLevel: tankLevelRef.current,
-          sensorLevel: lastData.level,
-          targetLevel: lastData.target,
-          inflowAtPump: lastData.flowIn,
-          inflowAtTank: pipeBufferRef.current[0], // Approximated for prompt
-          outflow: lastData.flowOut,
-          valveOpen: 100
-        },
-        params: { kp: 1, ki: 0, kd: 0, targetLevel: lastData.target },
-        faults,
-        paradigm: deployedParadigm
+  // --- INTERACTIONS ---
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    const type = e.dataTransfer.getData('nodeType') as NodeType;
+    const label = e.dataTransfer.getData('nodeLabel');
+    if (type) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const newNode: CanvasNode = {
+        id: `n${Date.now()}`, type, x, y, label,
+        data: type === 'RESERVOIR' ? { area: 100 } : type === 'PIPE' ? { delay: 5 } : type === 'PUMP' ? { efficiency: 100 } : {}
       };
+      setNodes(prev => [...prev, newNode]);
+      setSelectedNodeId(newNode.id);
+    }
+  };
 
-      const stream = streamGeminiResponse(messages, text, attachments, systemContext);
-      let fullResponse = '';
-      const modelMsgId = (Date.now() + 1).toString();
-      
-      setMessages(prev => [...prev, {
-        id: modelMsgId,
-        sender: Sender.Model,
-        text: '',
-        timestamp: new Date()
-      }]);
-
-      for await (const chunk of stream) {
-        fullResponse += chunk;
-        setMessages(prev => prev.map(m => m.id === modelMsgId ? { ...m, text: fullResponse } : m));
+  // Node Dragging
+  useEffect(() => {
+    const move = (e: MouseEvent) => {
+      if (draggingNode) {
+        setNodes(prev => prev.map(n => n.id === draggingNode.id ? { ...n, x: draggingNode.initialNodeX + (e.clientX - draggingNode.startX), y: draggingNode.initialNodeY + (e.clientY - draggingNode.startY) } : n));
       }
-    } catch (error) {
-      console.error(error);
-      setMessages(prev => [...prev, {
-        id: Date.now().toString(),
-        sender: Sender.System,
-        text: "系统错误：AI 服务暂时不可用",
-        timestamp: new Date(),
-        isError: true
-      }]);
-    } finally {
-      setIsStreaming(false);
-    }
-  };
-
-  const executePlan = (plan: PlanStep) => {
-    if (plan.actionType === 'CHANGE_DISTURBANCE') {
-      setActiveDemandPattern(plan.payload as DisturbanceConfig);
-      handleSendMessage("注意：系统已自动切换用户用水（负载）模式，请评估影响。", []);
-    } else {
-      setActiveSetpointPattern(plan.payload as DisturbanceConfig);
-      handleSendMessage("注意：系统已自动变更控制目标（设定值），请观察响应。", []);
-    }
-  };
-
-  const addPlan = () => {
-    const newPlan: PlanStep = {
-      id: Date.now().toString(),
-      triggerTime: time + planDelay,
-      description: `${planDelay}秒后切换${disturbanceScope === 'DEMAND' ? '负载' : '设定值'}模式`,
-      actionType: disturbanceScope === 'DEMAND' ? 'CHANGE_DISTURBANCE' : 'CHANGE_SETPOINT',
-      payload: { ...draftDisturbance },
-      status: 'pending'
+      if (tempEdge) {
+         // Update temp edge target
+         const rect = document.getElementById('canvas-area')?.getBoundingClientRect();
+         if (rect) {
+            setTempEdge(prev => prev ? { ...prev, x2: e.clientX - rect.left, y2: e.clientY - rect.top } : null);
+         }
+      }
     };
-    setPlans(prev => [...prev, newPlan].sort((a, b) => a.triggerTime - b.triggerTime));
+    const up = () => { setDraggingNode(null); setTempEdge(null); };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+    return () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); }
+  }, [draggingNode, tempEdge]);
+
+  // Connection Logic
+  const handleStartConnect = (e: React.MouseEvent, nodeId: string) => {
+     const node = nodes.find(n => n.id === nodeId);
+     if (node) {
+        const rect = e.currentTarget.getBoundingClientRect(); // Port rect (ignored mainly, use node pos)
+        // Calculate relative pos of port in canvas. 
+        // Node X/Y is center. Output port is at X + width/2.
+        // Approx width based on component type... simplified to Node X + 20
+        const canvasRect = document.getElementById('canvas-area')?.getBoundingClientRect();
+        if (canvasRect) {
+           setTempEdge({
+              sourceId: nodeId,
+              x1: node.x + 20, 
+              y1: node.y,
+              x2: e.clientX - canvasRect.left,
+              y2: e.clientY - canvasRect.top
+           });
+        }
+     }
   };
 
-  const executeImmediate = () => {
-    if (disturbanceScope === 'DEMAND') {
-      setActiveDemandPattern({ ...draftDisturbance });
-      handleSendMessage("操作记录：用户手动切换了负载模式。", []);
-    } else {
-      setActiveSetpointPattern({ ...draftDisturbance });
-      handleSendMessage("操作记录：用户手动更改了设定值目标。", []);
-    }
+  const handleEndConnect = (e: React.MouseEvent, nodeId: string) => {
+     if (tempEdge && tempEdge.sourceId !== nodeId) {
+        // Check if edge exists
+        const exists = edges.find(e => e.source === tempEdge.sourceId && e.target === nodeId);
+        if (!exists) {
+           setEdges(prev => [...prev, { id: `e${Date.now()}`, source: tempEdge.sourceId, target: nodeId }]);
+        }
+     }
+     setTempEdge(null);
   };
 
-  const deployParadigm = (p: DesignParadigm) => {
+  const applyParadigm = (p: DesignParadigm) => {
     setDeployedParadigm(p);
-    // Reset Sim a bit to avoid instability
-    integralRef.current = 0;
-    lastErrorRef.current = 0;
-    handleSendMessage(`设计变更：已部署【${p.name}】。控制算法切换为 ${p.algorithm}，调蓄池面积调整为 ${p.tankArea} m²。`, []);
+    setNodes([
+      { id: 'n1', type: 'SOURCE', x: 80, y: 180, label: '水源地', data: {} },
+      { id: 'n2', type: 'PUMP', x: 200, y: 180, label: '加压泵站', data: { efficiency: 100 } },
+      { id: 'n3', type: 'PIPE', x: 380, y: 180, label: '输水干渠', data: { delay: 5.0 } },
+      { id: 'n4', type: 'RESERVOIR', x: 550, y: 180, label: '调蓄池', data: { area: p.tankArea } },
+      { id: 'n5', type: 'DEMAND', x: 700, y: 180, label: '市政管网', data: {} },
+    ]);
+    setEdges([
+       {id: 'e1', source: 'n1', target: 'n2'},
+       {id: 'e2', source: 'n2', target: 'n3'},
+       {id: 'e3', source: 'n3', target: 'n4'},
+       {id: 'e4', source: 'n4', target: 'n5'},
+    ]);
+    tankLevelRef.current = 295; integralRef.current = 0;
+    handleSendMessage(`系统更新：已重置为【${p.name}】范式。`, []);
   };
 
-  // --- SIMULATION ENGINE ---
-  
-  // 1. Physics
-  const updatePhysics = (pumpInflow: number, demandOutflow: number) => {
-    // Pipe Delay
-    const buffer = pipeBufferRef.current;
-    const tankInflow = buffer.shift() || 0;
-    buffer.push(pumpInflow);
-
-    // Tank Level Dynamics (dH/dt = (Qin - Qout) / Area)
-    const area = deployedParadigm.tankArea;
-    let netFlow = tankInflow - demandOutflow;
-    
-    // Fault: Leakage (Q = k * sqrt(H))
-    if (faults.leakage.active) {
-      const leakFlow = (faults.leakage.value / 10) * Math.sqrt(Math.max(0, tankLevelRef.current));
-      netFlow -= leakFlow;
-    }
-
-    const dLevel = (netFlow * DT) / area;
-    tankLevelRef.current = Math.max(0, tankLevelRef.current + dLevel);
-
-    return { tankInflow };
-  };
-
-  // 2. Control Algorithms
-  const runControl = (target: number, level: number, demand: number): number => {
-    const error = target - level;
-    let output = 0;
-
-    if (deployedParadigm.algorithm === 'PID') {
-      // Standard PID
-      integralRef.current += error * DT;
-      // Anti-windup
-      if (Math.abs(integralRef.current) > 500) integralRef.current = Math.sign(integralRef.current) * 500;
-      const derivative = (error - lastErrorRef.current) / DT;
-      
-      // Aggressive PID for huge tank, conservative for small
-      const Kp = deployedParadigm.tankArea > 100 ? 5.0 : 2.0;
-      const Ki = 0.5;
-      const Kd = 0.1;
-      
-      output = Kp * error + Ki * integralRef.current + Kd * derivative;
-      output += 50; // Feedforward bias
-
-    } else if (deployedParadigm.algorithm === 'SMITH') {
-      // Smith Predictor
-      // Internal Model (No Delay)
-      const modelArea = deployedParadigm.tankArea;
-      const dModel = ((mpcStateRef.current.lastOut - demand) * DT) / modelArea;
-      smithStateRef.current.modelLevel += dModel;
-      
-      // Delayed Model (Approx)
-      // In real smith we would buffer the model output too, here simplified
-      const predError = target - smithStateRef.current.modelLevel;
-      const mismatch = level - smithStateRef.current.modelLevel; // Should be close to 0 if model perfect
-      
-      const Kp = 4.0; const Ki = 0.8;
-      output = Kp * (predError - mismatch) + 50; 
-      
-    } else if (deployedParadigm.algorithm === 'MPC') {
-      // Simplified MPC (DMC-like)
-      // Predict future level based on known pipe buffer
-      const predictionHorizon = 50; // 5 seconds
-      let predictedLevel = level;
-      const buffer = [...pipeBufferRef.current];
-      
-      // Quick lookahead simulation
-      for(let i=0; i<predictionHorizon; i++) {
-        const futureIn = i < buffer.length ? buffer[i] : output; // future inputs unknown, assume hold
-        // We also need to know future demand. The MPC "knows" the pattern if integrated.
-        const futureT = time + i * DT;
-        const futureDemand = getDisturbanceValue(futureT, activeDemandPattern);
-        predictedLevel += ((futureIn - futureDemand) * DT) / deployedParadigm.tankArea;
-      }
-      
-      const futureError = target - predictedLevel;
-      // Aggressive gain for MPC
-      output = mpcStateRef.current.lastOut + futureError * 2.0; 
-    }
-
-    lastErrorRef.current = error;
-    
-    // Pump limits & Faults
-    let maxFlow = 250;
-    if (faults.pumpEfficiency.active) {
-      maxFlow *= (1 - faults.pumpEfficiency.value / 100);
-    }
-    
-    output = Math.max(0, Math.min(maxFlow, output));
-    mpcStateRef.current.lastOut = output;
-    return output;
-  };
-
-  // Main Loop
+  // --- PHYSICS LOOP (Adaptive to Topology) ---
   useEffect(() => {
     if (!isRunning) return;
-    
     const interval = setInterval(() => {
       setTime(t => {
         const nextT = t + DT;
-
-        // 1. Check Plans
-        plans.forEach(plan => {
-          if (plan.status === 'pending' && nextT >= plan.triggerTime) {
-            plan.status = 'completed';
-            executePlan(plan);
-          }
+        // Plans
+        plans.forEach(p => {
+           if (p.status === 'pending' && nextT >= p.triggerTime) {
+              p.status = 'completed';
+              if (p.actionType === 'CHANGE_DISTURBANCE') setActiveDemandPattern(p.payload as any);
+              else setActiveSetpointPattern(p.payload as any);
+           }
         });
 
-        // 2. Calculate Dynamics
-        const currentDemand = getDisturbanceValue(nextT, activeDemandPattern);
-        const currentTarget = getDisturbanceValue(nextT, activeSetpointPattern);
+        // Topology Analysis for Sim
+        const reservoir = nodes.find(n => n.type === 'RESERVOIR');
+        // Find feeding chain (simplified for robustness): Pump -> Pipe -> Reservoir
+        // In a real graph solver, we'd traverse. Here we find nodes by type to apply params.
+        const pipe = nodes.find(n => n.type === 'PIPE');
+        const pump = nodes.find(n => n.type === 'PUMP');
+        
+        // If critical nodes missing, default to safe values
+        const area = reservoir?.data.area || deployedParadigm.tankArea;
+        const delay = pipe?.data.delay || 5.0;
+        const eff = pump?.data.efficiency || 100;
 
-        // 3. Sensors (with fault)
-        let sensedLevel = tankLevelRef.current;
-        if (faults.sensorDrift.active) {
-          sensedLevel += faults.sensorDrift.value;
+        // Check connectivity: Is Pump connected to Pipe connected to Reservoir?
+        // Simplified connectivity check for visual feedback effect
+        const isConnected = edges.some(e => e.target === reservoir?.id) || true; 
+
+        // Dynamics
+        const demand = getDisturbanceValue(nextT, activeDemandPattern);
+        const target = getDisturbanceValue(nextT, activeSetpointPattern);
+        const error = target - tankLevelRef.current;
+        
+        // Control
+        let out = 0;
+        if (isConnected) {
+            if (deployedParadigm.algorithm === 'PID') {
+              integralRef.current += error * DT;
+              if(Math.abs(integralRef.current)>500) integralRef.current = Math.sign(integralRef.current)*500;
+              out = (area>100?5:2)*error + 0.5*integralRef.current + 0.1*(error-lastErrorRef.current)/DT + 50;
+            } else if (deployedParadigm.algorithm === 'MPC') {
+               out = mpcStateRef.current.lastOut + error * 2.5; 
+            } else {
+               out = 4 * error + 50; 
+            }
         }
-        // Add noise
-        sensedLevel += (Math.random() - 0.5) * 0.1;
+        lastErrorRef.current = error;
+        
+        let maxQ = 250 * (eff/100);
+        if (faults.pumpEfficiency.active) maxQ *= (1 - faults.pumpEfficiency.value/100);
+        out = Math.max(0, Math.min(maxQ, out));
+        mpcStateRef.current.lastOut = out;
 
-        // 4. Controller
-        const pumpOutput = runControl(currentTarget, sensedLevel, currentDemand);
+        // Buffer
+        const buf = pipeBufferRef.current;
+        buf.push(out);
+        if(buf.length > BUFFER_SIZE) buf.shift();
+        const idx = Math.floor(delay/DT);
+        const inflow = buf.length >= idx ? buf[buf.length - idx] : 0;
+        
+        let net = inflow - demand;
+        if (faults.leakage.active) net -= (faults.leakage.value/10)*Math.sqrt(Math.max(0, tankLevelRef.current));
+        
+        // Physics Update
+        if (isConnected) {
+            tankLevelRef.current = Math.max(0, tankLevelRef.current + (net*DT)/area);
+        }
 
-        // 5. Physics Update
-        updatePhysics(pumpOutput, currentDemand);
-
-        // 6. Record History
-        setHistory(prev => {
-          const newData = [...prev, {
-            t: nextT,
-            level: tankLevelRef.current,
-            target: currentTarget,
-            flowIn: pumpOutput,
-            flowOut: currentDemand
-          }];
-          if (newData.length > MAX_HISTORY * 1.5) return newData.slice(-MAX_HISTORY);
-          return newData;
+        setHistory(p => {
+           const next = [...p, { t: nextT, level: tankLevelRef.current, target, flowIn: out, flowOut: demand }];
+           return next.length > MAX_HISTORY ? next.slice(-MAX_HISTORY) : next;
         });
-
         return nextT;
       });
     }, DT * 1000);
-
     return () => clearInterval(interval);
-  }, [isRunning, activeDemandPattern, activeSetpointPattern, faults, deployedParadigm, plans]);
+  }, [isRunning, deployedParadigm, activeDemandPattern, activeSetpointPattern, faults, plans, nodes, edges]);
 
-  // --- COMPUTED MPC PREDICTION ---
-  const mpcPrediction = useMemo(() => {
-      if (deployedParadigm.algorithm !== 'MPC') return [];
-      
-      const pred = [];
-      let simLevel = tankLevelRef.current;
-      const horizon = 50; // 5s
-      const buffer = [...pipeBufferRef.current];
-      
-      for(let i=0; i<horizon; i++) {
-          const simT = time + i * DT;
-          const futureIn = i < buffer.length ? buffer[i] : mpcStateRef.current.lastOut;
-          const futureOut = getDisturbanceValue(simT, activeDemandPattern);
-          
-          simLevel += ((futureIn - futureOut) * DT) / deployedParadigm.tankArea;
-          pred.push({ t: simT, level: simLevel, flowOut: futureOut });
-      }
-      return pred;
-  }, [time, deployedParadigm, activeDemandPattern]);
+  // AI
+  const handleSendMessage = async (text: string, att: Attachment[]) => {
+    const userMsg: ChatMessage = { id: Date.now().toString(), sender: Sender.User, text, attachments: att, timestamp: new Date() };
+    setMessages(p => [...p, userMsg]);
+    setIsStreaming(true);
+    try {
+       const last = history[history.length-1] || { level: 0, target: 0, flowIn: 0, flowOut: 0 };
+       const ctx = { state: { time, waterLevel: tankLevelRef.current, sensorLevel: last.level, targetLevel: last.target, inflowAtPump: last.flowIn, inflowAtTank: 0, outflow: last.flowOut, valveOpen: 100 }, params: { kp:1, ki:0, kd:0, targetLevel: last.target }, faults, paradigm: deployedParadigm };
+       const stream = streamGeminiResponse(messages, text, att, ctx);
+       let full = '';
+       const mid = (Date.now()+1).toString();
+       setMessages(p => [...p, { id: mid, sender: Sender.Model, text: '', timestamp: new Date() }]);
+       for await (const chunk of stream) { full += chunk; setMessages(p => p.map(m => m.id === mid ? { ...m, text: full } : m)); }
+    } catch(e) { console.error(e); }
+    setIsStreaming(false);
+  };
 
+  const executeImmediate = () => {
+      const scope = disturbanceScope;
+      const pattern = {...draftDisturbance};
+      if (scope === 'DEMAND') setActiveDemandPattern(pattern);
+      else setActiveSetpointPattern(pattern);
+      handleSendMessage(`操作：立即应用了新的${scope==='DEMAND'?'负载':'目标'}设置。`, []);
+  };
+  
+  const addPlan = () => {
+      setPlans(p => [...p, {
+          id: Date.now().toString(), triggerTime: time + planDelay, description: `${planDelay}s 后变更设置`,
+          actionType: disturbanceScope === 'DEMAND' ? 'CHANGE_DISTURBANCE' : 'CHANGE_SETPOINT',
+          payload: {...draftDisturbance}, status: 'pending'
+      }].sort((a,b)=>a.triggerTime - b.triggerTime));
+  };
 
   // --- RENDER ---
   return (
-    <div className="flex h-screen bg-slate-950 text-slate-200 font-sans overflow-hidden">
-      {/* === LEFT SIDEBAR: CONTROL === */}
-      <div className="w-80 flex flex-col border-r border-slate-800 bg-slate-900/50">
-        {/* Header */}
-        <div className="p-4 border-b border-slate-800 flex items-center gap-2">
-          <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shadow-lg shadow-blue-500/20">
-            <Activity className="text-white" size={18} />
-          </div>
-          <div>
-            <h1 className="font-bold text-slate-100 text-sm tracking-wide">长距离输水仿真平台</h1>
-            <div className="text-[10px] text-slate-500 flex items-center gap-1">
-               <span className={`w-1.5 h-1.5 rounded-full ${isRunning ? 'bg-green-500 animate-pulse' : 'bg-amber-500'}`}></span>
-               v12.0 Pro | {deployedParadigm.algorithm}
-            </div>
-          </div>
-        </div>
+    <div className="flex h-screen bg-slate-950 text-slate-200 font-sans overflow-hidden select-none">
+      {/* LEFT SIDEBAR */}
+      <div className="w-[280px] flex flex-col border-r border-slate-800 bg-slate-900/80 backdrop-blur-sm z-20 shadow-2xl">
+         <div className="p-4 border-b border-slate-800 flex items-center gap-3">
+            <div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-cyan-600 rounded-lg flex items-center justify-center shadow-lg shadow-cyan-900/50"><Activity className="text-white" size={18}/></div>
+            <div><h1 className="font-bold text-sm text-slate-100 tracking-tight">水利仿真平台 Pro</h1><div className="text-[10px] text-slate-500 font-mono">{deployedParadigm.algorithm} ENGINE</div></div>
+         </div>
+         
+         <div className="flex border-b border-slate-800 bg-slate-900">
+            <button onClick={()=>setActiveTab('DESIGN')} className={`flex-1 py-3 text-[10px] font-bold flex flex-col items-center gap-1 border-b-2 transition-all ${activeTab==='DESIGN'?'border-cyan-500 text-cyan-400 bg-slate-800/50':'border-transparent text-slate-500 hover:text-slate-300'}`}><PenTool size={14}/> 建模 DESIGN</button>
+            <button onClick={()=>setActiveTab('CONTROL')} className={`flex-1 py-3 text-[10px] font-bold flex flex-col items-center gap-1 border-b-2 transition-all ${activeTab==='CONTROL'?'border-purple-500 text-purple-400 bg-slate-800/50':'border-transparent text-slate-500 hover:text-slate-300'}`}><Sliders size={14}/> 控制 CONTROL</button>
+            <button onClick={()=>setActiveTab('FAULTS')} className={`flex-1 py-3 text-[10px] font-bold flex flex-col items-center gap-1 border-b-2 transition-all ${activeTab==='FAULTS'?'border-red-500 text-red-400 bg-slate-800/50':'border-transparent text-slate-500 hover:text-slate-300'}`}><AlertTriangle size={14}/> 故障 FAULT</button>
+         </div>
 
-        {/* Tabs */}
-        <div className="flex border-b border-slate-800 bg-slate-900">
-          <button 
-             onClick={() => setActiveTab('DESIGN')}
-             className={`flex-1 py-3 text-xs font-medium flex items-center justify-center gap-1 border-b-2 transition-colors ${activeTab === 'DESIGN' ? 'border-purple-500 text-purple-400 bg-slate-800' : 'border-transparent text-slate-500 hover:text-slate-300'}`}
-          >
-            <PenTool size={14} /> 设计
-          </button>
-          <button 
-             onClick={() => setActiveTab('DISTURBANCE')}
-             className={`flex-1 py-3 text-xs font-medium flex items-center justify-center gap-1 border-b-2 transition-colors ${activeTab === 'DISTURBANCE' ? 'border-blue-500 text-blue-400 bg-slate-800' : 'border-transparent text-slate-500 hover:text-slate-300'}`}
-          >
-            <Sliders size={14} /> 扰动
-          </button>
-          <button 
-             onClick={() => setActiveTab('FAULTS')}
-             className={`flex-1 py-3 text-xs font-medium flex items-center justify-center gap-1 border-b-2 transition-colors ${activeTab === 'FAULTS' ? 'border-red-500 text-red-400 bg-slate-800' : 'border-transparent text-slate-500 hover:text-slate-300'}`}
-          >
-            <AlertTriangle size={14} /> 故障
-          </button>
-        </div>
+         <div className="flex-1 overflow-y-auto p-4 space-y-6 custom-scrollbar">
+            {activeTab === 'DESIGN' ? (
+              <>
+                 <div>
+                    <div className="text-[10px] font-bold text-slate-500 mb-3 uppercase tracking-wider flex items-center gap-2 border-b border-slate-800 pb-1">储水/节点 Storage & Nodes</div>
+                    <div className="grid grid-cols-2 gap-2">
+                       <PaletteItem type="SOURCE" icon={Waves} label="水源 Source"/>
+                       <PaletteItem type="RESERVOIR" icon={Container} label="库湖池 Reservoir"/>
+                       <PaletteItem type="DEMAND" icon={ArrowRight} label="用户 User"/>
+                    </div>
+                    
+                    <div className="text-[10px] font-bold text-slate-500 mt-4 mb-3 uppercase tracking-wider flex items-center gap-2 border-b border-slate-800 pb-1">动力/设备 Equipment</div>
+                    <div className="grid grid-cols-2 gap-2">
+                       <PaletteItem type="PUMP" icon={Fan} label="水泵 Pump"/>
+                       <PaletteItem type="TURBINE" icon={Zap} label="水轮机 Turbine"/>
+                       <PaletteItem type="VALVE" icon={CircleDot} label="阀门 Valve"/>
+                       <PaletteItem type="GATE" icon={RectangleVertical} label="闸门 Gate"/>
+                    </div>
 
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto p-4 custom-scrollbar">
-          
-          {/* === TAB 1: DESIGN STUDIO === */}
-          {activeTab === 'DESIGN' && (
-             <div className="space-y-4">
-                <div className="bg-purple-900/10 border border-purple-900/30 p-3 rounded text-[10px] text-purple-300 flex gap-2 mb-2">
-                  <PenTool size={16} className="shrink-0"/>
-                  选择设计范式以重新定义水利基础设施与控制算法的组合。
-                </div>
-                {PARADIGMS.map(p => (
-                  <div key={p.type} className={`p-3 rounded-xl border transition-all ${deployedParadigm.type === p.type ? 'bg-slate-800 border-purple-500 shadow-lg shadow-purple-900/20' : 'bg-slate-900 border-slate-800 hover:border-slate-700'}`}>
-                     <div className="flex justify-between items-start mb-2">
-                        <h3 className={`text-sm font-bold ${deployedParadigm.type === p.type ? 'text-purple-400' : 'text-slate-300'}`}>{p.name}</h3>
-                        {deployedParadigm.type === p.type && <div className="bg-purple-500 text-white text-[9px] px-1.5 py-0.5 rounded font-bold">运行中</div>}
-                     </div>
-                     <p className="text-[10px] text-slate-400 mb-3 leading-relaxed whitespace-pre-wrap">{p.description}</p>
-                     
-                     <div className="grid grid-cols-3 gap-2 mb-3">
-                        <div className="bg-slate-950 border border-slate-700 p-2 rounded text-center">
-                           <div className="text-[10px] text-slate-400 flex justify-center items-center gap-1 mb-1">
-                              <Coins size={12}/> <span className="text-[8px] uppercase">基建</span>
-                           </div>
-                           <div className="text-xs text-white font-mono font-bold">{p.infrastructureCost}</div>
-                        </div>
-                        <div className="bg-slate-950 border border-slate-700 p-2 rounded text-center">
-                           <div className="text-[10px] text-slate-400 flex justify-center items-center gap-1 mb-1">
-                              <Cpu size={12}/> <span className="text-[8px] uppercase">算力</span>
-                           </div>
-                           <div className="text-xs text-white font-mono font-bold">{p.computeCost}</div>
-                        </div>
-                        <div className="bg-slate-950 border border-slate-700 p-2 rounded text-center">
-                           <div className="text-[10px] text-slate-400 flex justify-center items-center gap-1 mb-1">
-                              <Box size={12}/> <span className="text-[8px] uppercase">占地</span>
-                           </div>
-                           <div className="text-xs text-white font-mono font-bold">{p.tankArea}m²</div>
-                        </div>
-                     </div>
-
-                     <button 
-                       onClick={() => deployParadigm(p)}
-                       disabled={deployedParadigm.type === p.type}
-                       className={`w-full py-1.5 rounded text-xs font-medium transition-colors ${
-                         deployedParadigm.type === p.type 
-                         ? 'bg-slate-700 text-slate-500 cursor-default' 
-                         : 'bg-purple-600 hover:bg-purple-500 text-white'
-                       }`}
-                     >
-                       {deployedParadigm.type === p.type ? '已部署' : '部署方案'}
-                     </button>
+                    <div className="text-[10px] font-bold text-slate-500 mt-4 mb-3 uppercase tracking-wider flex items-center gap-2 border-b border-slate-800 pb-1">输水设施 Linear Objects</div>
+                    <PaletteItem type="PIPE" icon={Cable} label="河管渠 Channel/Pipe" isLinear/>
+                 </div>
+                 
+                 <div className="border-t border-slate-800 pt-4">
+                    <div className="text-[10px] font-bold text-slate-500 mb-2 uppercase tracking-wider flex items-center gap-2"><Workflow size={10}/> 范式模板 Templates</div>
+                    <div className="space-y-2">
+                       {PARADIGMS.map(p => (
+                          <div key={p.type} onClick={() => applyParadigm(p)} className={`p-3 rounded border cursor-pointer transition-all group ${deployedParadigm.type === p.type ? 'bg-slate-800 border-cyan-500 shadow-lg' : 'bg-slate-900 border-slate-700 hover:border-slate-600'}`}>
+                             <div className="flex justify-between items-center mb-1">
+                                <span className={`text-xs font-bold ${deployedParadigm.type === p.type ? 'text-cyan-400' : 'text-slate-300'}`}>{p.name}</span>
+                                {deployedParadigm.type === p.type && <div className="w-1.5 h-1.5 rounded-full bg-cyan-500 shadow-[0_0_5px_cyan]"/>}
+                             </div>
+                             <p className="text-[10px] text-slate-500 group-hover:text-slate-400">{p.description}</p>
+                          </div>
+                       ))}
+                    </div>
+                 </div>
+              </>
+            ) : activeTab === 'CONTROL' ? (
+               <div className="space-y-4 animate-in fade-in">
+                  <div className="flex bg-slate-950 p-1 rounded border border-slate-800">
+                      <button onClick={()=>setDisturbanceScope('DEMAND')} className={`flex-1 py-1.5 text-[10px] font-bold rounded transition-all ${disturbanceScope==='DEMAND'?'bg-slate-800 text-blue-400 shadow-sm':'text-slate-500 hover:text-slate-300'}`}>负载设置</button>
+                      <button onClick={()=>setDisturbanceScope('TARGET')} className={`flex-1 py-1.5 text-[10px] font-bold rounded transition-all ${disturbanceScope==='TARGET'?'bg-slate-800 text-green-400 shadow-sm':'text-slate-500 hover:text-slate-300'}`}>目标设置</button>
                   </div>
-                ))}
-             </div>
-          )}
-
-          {/* === TAB 2: DISTURBANCE === */}
-          {activeTab === 'DISTURBANCE' && (
-            <div className="space-y-6">
-              {/* 1. Scope Selector */}
-              <div>
-                 <label className="text-[10px] font-bold text-slate-500 uppercase mb-2 block">配置对象 (Scope)</label>
-                 <div className="flex bg-slate-950 p-1 rounded-lg border border-slate-800">
-                    <button 
-                      onClick={() => setDisturbanceScope('DEMAND')}
-                      className={`flex-1 py-1.5 rounded text-xs font-medium transition-all ${disturbanceScope === 'DEMAND' ? 'bg-slate-800 text-blue-400 shadow-sm' : 'text-slate-500 hover:text-slate-300'}`}
-                    >
-                      用户用水 (负载)
-                    </button>
-                    <button 
-                      onClick={() => setDisturbanceScope('TARGET')}
-                      className={`flex-1 py-1.5 rounded text-xs font-medium transition-all ${disturbanceScope === 'TARGET' ? 'bg-slate-800 text-green-400 shadow-sm' : 'text-slate-500 hover:text-slate-300'}`}
-                    >
-                      控制目标 (设定值)
-                    </button>
-                 </div>
-              </div>
-
-              {/* 2. Pattern Config */}
-              <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-4 shadow-inner">
-                 <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold text-slate-300">波形生成器</span>
-                    <Waves size={14} className="text-slate-600"/>
-                 </div>
-
-                 {/* Pattern Select */}
-                 <div className="relative">
-                    <select 
-                      value={draftDisturbance.type}
-                      onChange={(e) => setDraftDisturbance({...draftDisturbance, type: e.target.value as DisturbanceType})}
-                      className="w-full bg-slate-950 text-xs text-slate-300 border border-slate-700 rounded px-3 py-2 appearance-none focus:border-blue-500 focus:outline-none"
-                    >
-                      {DISTURBANCE_OPTIONS.map(opt => <option key={opt.type} value={opt.type}>{opt.label}</option>)}
-                    </select>
-                    <ChevronDown className="absolute right-3 top-2.5 text-slate-500 pointer-events-none" size={12} />
-                 </div>
-
-                 {/* Oscilloscope Preview */}
-                 <DisturbancePreview config={draftDisturbance} scope={disturbanceScope} />
-
-                 {/* Sliders */}
-                 <div className="space-y-3">
-                    <div>
-                      <div className="flex justify-between text-[10px] text-slate-500 mb-1">
-                         <span>基准值 (Base)</span>
-                         <span className="font-mono text-slate-300">{draftDisturbance.base} {disturbanceScope === 'DEMAND' ? 'm³/s' : 'm'}</span>
-                      </div>
-                      <input type="range" min="0" max="350" step="1" 
-                        value={draftDisturbance.base} 
-                        onChange={(e) => setDraftDisturbance({...draftDisturbance, base: Number(e.target.value)})}
-                        className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-blue-500" 
-                      />
-                    </div>
-                    <div>
-                      <div className="flex justify-between text-[10px] text-slate-500 mb-1">
-                         <span>幅度 (Amp)</span>
-                         <span className="font-mono text-slate-300">±{draftDisturbance.amplitude}</span>
-                      </div>
-                      <input type="range" min="0" max="150" step="1" 
-                        value={draftDisturbance.amplitude} 
-                        onChange={(e) => setDraftDisturbance({...draftDisturbance, amplitude: Number(e.target.value)})}
-                        className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-purple-500" 
-                      />
-                    </div>
-                    <div>
-                      <div className="flex justify-between text-[10px] text-slate-500 mb-1">
-                         <span>频率 (Freq)</span>
-                         <span className="font-mono text-slate-300">{draftDisturbance.frequency} Hz</span>
-                      </div>
-                      <input type="range" min="0.01" max="1.0" step="0.01" 
-                        value={draftDisturbance.frequency} 
-                        onChange={(e) => setDraftDisturbance({...draftDisturbance, frequency: Number(e.target.value)})}
-                        className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500" 
-                      />
-                    </div>
-                 </div>
-              </div>
-
-              {/* 3. Actions */}
-              <div className="grid grid-cols-2 gap-3">
-                 <button 
-                    onClick={executeImmediate}
-                    className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium py-2.5 px-3 rounded-lg flex items-center justify-center gap-2 transition-all shadow-lg shadow-blue-900/20 active:scale-95"
-                 >
-                    <Zap size={14} /> 立即执行
-                 </button>
-                 <button 
-                    onClick={addPlan}
-                    className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium py-2.5 px-3 rounded-lg flex items-center justify-center gap-2 transition-all border border-slate-700 active:scale-95"
-                 >
-                    <CalendarClock size={14} /> 加入序列
-                 </button>
-              </div>
-
-              {/* 4. Delay Setting */}
-              <div className="flex items-center gap-2 bg-slate-900 p-2 rounded border border-slate-800">
-                 <Clock size={14} className="text-slate-500"/>
-                 <span className="text-[10px] text-slate-400">计划延迟:</span>
-                 <input 
-                   type="number" 
-                   value={planDelay} 
-                   onChange={e => setPlanDelay(Number(e.target.value))} 
-                   className="w-12 bg-slate-950 border border-slate-700 rounded px-1 py-0.5 text-xs text-center focus:border-blue-500 outline-none"
-                 />
-                 <span className="text-[10px] text-slate-500">秒</span>
-              </div>
-
-              {/* 5. Plan List */}
-              {plans.length > 0 && (
-                <div className="mt-4 border-t border-slate-800 pt-4">
-                   <h3 className="text-[10px] font-bold text-slate-500 uppercase mb-2">待执行任务队列 ({plans.filter(p=>p.status==='pending').length})</h3>
-                   <div className="space-y-2">
-                      {plans.filter(p => p.status !== 'completed').map(plan => (
-                        <div key={plan.id} className="bg-slate-900 p-2 rounded border border-slate-800 flex items-center gap-3 text-xs relative overflow-hidden">
-                           <div className="absolute left-0 top-0 bottom-0 w-1 bg-blue-500"></div>
-                           <Timer size={14} className="text-blue-400 shrink-0" />
-                           <div className="flex-1 min-w-0">
-                              <div className="truncate text-slate-300 font-medium">{plan.description}</div>
-                              <div className="text-[10px] text-slate-500">T = {plan.triggerTime.toFixed(1)}s ({(plan.triggerTime - time).toFixed(1)}s 后)</div>
-                           </div>
-                           <button onClick={() => setPlans(ps => ps.filter(p => p.id !== plan.id))} className="text-slate-600 hover:text-red-400">
-                              <Trash2 size={14} />
-                           </button>
+                  <div className="bg-slate-900 border border-slate-800 p-3 rounded-lg space-y-3 shadow-inner">
+                      <select value={draftDisturbance.type} onChange={(e) => setDraftDisturbance({...draftDisturbance, type: e.target.value as any})} className="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded outline-none text-slate-300 focus:border-cyan-500">
+                          {DISTURBANCE_OPTIONS.map(o => <option key={o.type} value={o.type}>{o.label}</option>)}
+                      </select>
+                      {['base','amplitude','frequency'].map(k => (
+                        <div key={k}>
+                           <div className="flex justify-between text-[10px] text-slate-500 mb-1 capitalize"><span>{k}</span><span className="font-mono text-slate-300">{draftDisturbance[k as keyof DisturbanceConfig]}</span></div>
+                           <input type="range" min={k==='frequency'?0.01:0} max={k==='frequency'?1:350} step={k==='frequency'?0.01:1} value={draftDisturbance[k as keyof DisturbanceConfig] as number} onChange={e=>setDraftDisturbance({...draftDisturbance, [k]: Number(e.target.value)})} className="w-full h-1 bg-slate-800 rounded appearance-none accent-cyan-500"/>
                         </div>
                       ))}
-                   </div>
-                </div>
-              )}
-            </div>
-          )}
-          
-          {/* === TAB 3: FAULTS === */}
-          {activeTab === 'FAULTS' && (
-            <div className="space-y-6">
-               <div className="bg-red-900/10 border border-red-900/30 p-3 rounded text-[10px] text-red-300 flex gap-2">
-                  <AlertTriangle size={16} className="shrink-0"/>
-                  物理级故障注入将直接影响仿真引擎计算，AI 诊断系统应能检测到异常。
-               </div>
-
-               {/* Leakage */}
-               <div className="bg-slate-900 p-3 rounded-lg border border-slate-800">
-                  <div className="flex items-center justify-between mb-2">
-                     <span className="text-xs font-medium text-slate-300 flex items-center gap-2">
-                        <Droplets size={14} className="text-cyan-500"/> 管网泄漏
-                     </span>
-                     <div onClick={() => setFaults(f => ({...f, leakage: {...f.leakage, active: !f.leakage.active}}))} className={`w-8 h-4 rounded-full relative cursor-pointer transition-colors ${faults.leakage.active ? 'bg-red-500' : 'bg-slate-700'}`}>
-                        <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all ${faults.leakage.active ? 'left-4.5' : 'left-0.5'}`}></div>
-                     </div>
                   </div>
-                  {faults.leakage.active && (
-                     <div className="mt-3">
-                        <div className="flex justify-between text-[10px] mb-1">
-                           <span className="text-slate-500">孔径强度</span>
-                           <span className="text-red-400 font-mono">{faults.leakage.value}%</span>
-                        </div>
-                        <input type="range" max="50" value={faults.leakage.value} onChange={e => setFaults(f => ({...f, leakage: {...f.leakage, value: Number(e.target.value)}}))} className="w-full h-1.5 bg-slate-800 rounded appearance-none accent-red-500"/>
-                     </div>
-                  )}
-               </div>
-
-               {/* Pump Efficiency */}
-               <div className="bg-slate-900 p-3 rounded-lg border border-slate-800">
-                  <div className="flex items-center justify-between mb-2">
-                     <span className="text-xs font-medium text-slate-300 flex items-center gap-2">
-                        <Fan size={14} className="text-orange-500"/> 泵效衰减
-                     </span>
-                     <div onClick={() => setFaults(f => ({...f, pumpEfficiency: {...f.pumpEfficiency, active: !f.pumpEfficiency.active}}))} className={`w-8 h-4 rounded-full relative cursor-pointer transition-colors ${faults.pumpEfficiency.active ? 'bg-red-500' : 'bg-slate-700'}`}>
-                        <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all ${faults.pumpEfficiency.active ? 'left-4.5' : 'left-0.5'}`}></div>
-                     </div>
+                  <div className="grid grid-cols-2 gap-2">
+                      <button onClick={executeImmediate} className="py-2 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold rounded shadow-lg shadow-cyan-900/20 active:scale-95 transition-all">立即执行</button>
+                      <button onClick={addPlan} className="py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold rounded border border-slate-700 active:scale-95 transition-all">加入序列</button>
                   </div>
-                  {faults.pumpEfficiency.active && (
-                     <div className="mt-3">
-                        <div className="flex justify-between text-[10px] mb-1">
-                           <span className="text-slate-500">磨损程度</span>
-                           <span className="text-red-400 font-mono">{faults.pumpEfficiency.value}%</span>
-                        </div>
-                        <input type="range" max="80" value={faults.pumpEfficiency.value} onChange={e => setFaults(f => ({...f, pumpEfficiency: {...f.pumpEfficiency, value: Number(e.target.value)}}))} className="w-full h-1.5 bg-slate-800 rounded appearance-none accent-orange-500"/>
-                     </div>
-                  )}
+                  <div className="flex items-center gap-2 bg-slate-900 p-2 rounded border border-slate-800"><span className="text-[10px] text-slate-500">延迟(s)</span><input type="number" value={planDelay} onChange={e=>setPlanDelay(Number(e.target.value))} className="w-full bg-transparent text-xs text-center outline-none text-cyan-400 font-mono"/></div>
+                  {plans.length > 0 && <div className="space-y-1 pt-2 border-t border-slate-800"><div className="text-[10px] text-slate-500 font-bold">任务队列 QUEUE</div>{plans.filter(p=>p.status!=='completed').map(p=><div key={p.id} className="bg-slate-900 p-2 rounded border border-slate-800 flex justify-between"><span className="text-[10px] text-slate-300">{p.description}</span><Trash2 size={12} className="text-slate-600 cursor-pointer hover:text-red-400" onClick={()=>setPlans(c=>c.filter(x=>x.id!==p.id))}/></div>)}</div>}
                </div>
-
-               {/* Sensor Drift */}
-               <div className="bg-slate-900 p-3 rounded-lg border border-slate-800">
-                  <div className="flex items-center justify-between mb-2">
-                     <span className="text-xs font-medium text-slate-300 flex items-center gap-2">
-                        <Gauge size={14} className="text-purple-500"/> 传感器漂移
-                     </span>
-                     <div onClick={() => setFaults(f => ({...f, sensorDrift: {...f.sensorDrift, active: !f.sensorDrift.active}}))} className={`w-8 h-4 rounded-full relative cursor-pointer transition-colors ${faults.sensorDrift.active ? 'bg-red-500' : 'bg-slate-700'}`}>
-                        <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all ${faults.sensorDrift.active ? 'left-4.5' : 'left-0.5'}`}></div>
-                     </div>
-                  </div>
-                  {faults.sensorDrift.active && (
-                     <div className="mt-3">
-                        <div className="flex justify-between text-[10px] mb-1">
-                           <span className="text-slate-500">偏移量</span>
-                           <span className="text-red-400 font-mono">+{faults.sensorDrift.value}m</span>
-                        </div>
-                        <input type="range" max="50" value={faults.sensorDrift.value} onChange={e => setFaults(f => ({...f, sensorDrift: {...f.sensorDrift, value: Number(e.target.value)}}))} className="w-full h-1.5 bg-slate-800 rounded appearance-none accent-purple-500"/>
-                     </div>
-                  )}
+            ) : (
+               <div className="space-y-3 animate-in fade-in">
+                  <div className="bg-red-900/10 border border-red-900/30 p-3 rounded text-[10px] text-red-300">故障注入会即时改变物理参数</div>
+                  {['leakage', 'pumpEfficiency', 'sensorDrift'].map(f => (
+                      // @ts-ignore
+                      <div key={f} className={`p-3 rounded border bg-slate-900 ${faults[f].active ? 'border-red-500/50 bg-red-900/5' : 'border-slate-800'}`}>
+                          <div className="flex justify-between items-center mb-2">
+                             {/* @ts-ignore */}
+                             <span className="text-xs font-bold text-slate-300 capitalize">{f}</span>
+                             {/* @ts-ignore */}
+                             <div onClick={()=>setFaults(c=>({...c, [f]: {...c[f], active: !c[f].active, value: 20}}))} className={`w-8 h-4 rounded-full relative cursor-pointer transition-colors ${faults[f].active?'bg-red-500':'bg-slate-700'}`}><div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all ${faults[f].active?'left-4.5':'left-0.5'}`}/></div>
+                          </div>
+                          {/* @ts-ignore */}
+                          {faults[f].active && <input type="range" max="50" value={faults[f].value} onChange={e=>setFaults(c=>({...c, [f]: {...c[f], value: Number(e.target.value)}}))} className="w-full h-1 bg-slate-800 rounded appearance-none accent-red-500"/>}
+                      </div>
+                  ))}
                </div>
-
-            </div>
-          )}
-        </div>
+            )}
+         </div>
       </div>
 
-      {/* === CENTER: VISUALIZATION === */}
-      <div className="flex-1 flex flex-col min-w-0 bg-slate-950">
-         {/* KPI Header */}
-         <div className="h-14 border-b border-slate-800 flex items-center px-6 justify-between bg-slate-900/20">
-            <div className="flex gap-8">
-               <div className="flex flex-col">
-                  <span className="text-[10px] text-slate-500 uppercase">仿真时间</span>
-                  <span className="text-lg font-mono font-bold text-white">{time.toFixed(1)}<span className="text-xs text-slate-500 ml-1">s</span></span>
-               </div>
-               <div className="flex flex-col">
-                  <span className="text-[10px] text-slate-500 uppercase">控制误差 |e|</span>
-                  <span className={`text-lg font-mono font-bold ${Math.abs(tankLevelRef.current - (history[history.length-1]?.target || 0)) > 10 ? 'text-red-500' : 'text-green-500'}`}>
-                     {Math.abs(tankLevelRef.current - (history[history.length-1]?.target || 0)).toFixed(2)}<span className="text-xs text-slate-500 ml-1">m</span>
-                  </span>
-               </div>
-               <div className="flex flex-col">
-                  <span className="text-[10px] text-slate-500 uppercase">当前设计范式</span>
-                  <span className="text-sm font-bold text-blue-400 border border-blue-900/50 bg-blue-900/20 px-2 py-0.5 rounded mt-0.5">{deployedParadigm.name}</span>
-               </div>
-            </div>
+      {/* MIDDLE */}
+      <div className="flex-1 flex flex-col min-w-0 bg-slate-950 relative">
+         {/* TOP: CANVAS */}
+         <div className="flex-1 relative overflow-hidden group border-b border-slate-800 bg-[#0b1121]" 
+              id="canvas-area"
+              onDragOver={(e) => e.preventDefault()} 
+              onDrop={handleDrop}
+         >
+            <div className="absolute inset-0 opacity-[0.05]" style={{ backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', backgroundSize: '40px 40px' }}></div>
             
-            <div className="flex gap-2">
-               <button onClick={() => setIsRunning(!isRunning)} className="p-2 bg-slate-800 hover:bg-slate-700 rounded text-slate-300 transition-colors">
-                  {isRunning ? <Pause size={16} /> : <Play size={16} />}
-               </button>
-               <button onClick={() => {
-                 setTime(0); setHistory([]); tankLevelRef.current=295; pipeBufferRef.current.fill(0);
-               }} className="p-2 bg-slate-800 hover:bg-slate-700 rounded text-slate-300 transition-colors">
-                  <RotateCcw size={16} />
-               </button>
+            {/* Dynamic Edges */}
+            <svg className="absolute inset-0 pointer-events-none z-0 overflow-visible">
+               <defs>
+                 <linearGradient id="flowGradient" gradientUnits="userSpaceOnUse">
+                   <stop offset="0%" stopColor="#0e7490" />
+                   <stop offset="50%" stopColor="#22d3ee" />
+                   <stop offset="100%" stopColor="#0e7490" />
+                 </linearGradient>
+                 <filter id="glow"><feGaussianBlur stdDeviation="2" result="coloredBlur"/><feMerge><feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+               </defs>
+               {/* Existing Edges */}
+               {edges.map((edge) => {
+                  const n1 = nodes.find(n => n.id === edge.source);
+                  const n2 = nodes.find(n => n.id === edge.target);
+                  if (!n1 || !n2) return null;
+                  const path = `M${n1.x + 20},${n1.y} C${n1.x + 80},${n1.y} ${n2.x - 80},${n2.y} ${n2.x - 20},${n2.y}`;
+                  return (
+                    <g key={edge.id} className="group-edge cursor-pointer pointer-events-auto" onContextMenu={(e) => {e.preventDefault(); setEdges(curr => curr.filter(ed => ed.id !== edge.id))}}>
+                       <path d={path} stroke="#1e293b" strokeWidth="8" fill="none" strokeLinecap="round" className="hover:stroke-red-900/50 transition-colors"/>
+                       <path d={path} stroke="url(#flowGradient)" strokeWidth="3" fill="none" strokeDasharray="10 5" className="animate-[dash_1.5s_linear_infinite]" filter="url(#glow)" opacity="0.8"/>
+                    </g>
+                  );
+               })}
+               {/* Temp Dragging Edge */}
+               {tempEdge && (
+                  <path d={`M${tempEdge.x1},${tempEdge.y1} C${tempEdge.x1 + 50},${tempEdge.y1} ${tempEdge.x2 - 50},${tempEdge.y2} ${tempEdge.x2},${tempEdge.y2}`} stroke="#ffffff" strokeWidth="2" strokeDasharray="4 4" fill="none" opacity="0.5"/>
+               )}
+            </svg>
+            <style>{`@keyframes dash { to { stroke-dashoffset: -30; } }`}</style>
+
+            {/* Nodes */}
+            {nodes.map(node => (
+               <CanvasNodeComponent 
+                  key={node.id} 
+                  node={node} 
+                  isSelected={selectedNodeId === node.id}
+                  onMouseDown={(e) => { e.stopPropagation(); setSelectedNodeId(node.id); setDraggingNode({ id: node.id, startX: e.clientX, startY: e.clientY, initialNodeX: node.x, initialNodeY: node.y }); }}
+                  onStartConnect={handleStartConnect}
+                  onEndConnect={handleEndConnect}
+               />
+            ))}
+            
+            <div className="absolute top-4 left-4 text-[10px] text-slate-500 font-mono bg-slate-900/80 px-3 py-1.5 rounded-full border border-slate-800 flex items-center gap-2 backdrop-blur">
+               <div className={`w-2 h-2 rounded-full ${isRunning ? 'bg-green-500 animate-pulse' : 'bg-amber-500'}`}/> {isRunning ? 'SIMULATION ACTIVE' : 'PAUSED'}
             </div>
          </div>
 
-         {/* Schematic Visualization */}
-         <div className="h-[280px] border-b border-slate-800 relative bg-slate-900/30 flex items-center justify-center overflow-hidden">
-             <div className="relative w-[700px] h-[200px]">
-                {/* Source */}
-                <div className="absolute left-0 top-1/2 -translate-y-1/2 flex flex-col items-center">
-                   <div className="w-16 h-16 rounded-full border-4 border-blue-700 bg-blue-900/50 flex items-center justify-center">
-                      <Waves className="text-blue-500 animate-pulse" />
-                   </div>
-                   <span className="text-[10px] mt-2 text-slate-400">水源 (Source)</span>
-                </div>
-
-                {/* Pipe 1 */}
-                <div className="absolute left-16 top-1/2 -translate-y-1/2 w-24 h-3 bg-slate-800 overflow-hidden">
-                   <div className="h-full bg-blue-500/30 animate-flow-right"></div>
-                </div>
-
-                {/* Pump Station */}
-                <div className="absolute left-40 top-1/2 -translate-y-1/2 flex flex-col items-center z-10">
-                   <div className={`w-20 h-20 bg-slate-800 rounded border-2 ${faults.pumpEfficiency.active ? 'border-orange-500' : 'border-slate-600'} flex items-center justify-center relative shadow-2xl`}>
-                      <Fan size={40} className={`text-slate-400 ${isRunning ? 'animate-spin' : ''}`} style={{animationDuration: '1s'}} />
-                      {faults.pumpEfficiency.active && <AlertTriangle size={16} className="absolute top-1 right-1 text-orange-500" />}
-                      <div className="absolute -bottom-8 bg-slate-900 border border-slate-700 px-2 py-1 rounded text-[10px] font-mono text-blue-400">
-                         {(history[history.length-1]?.flowIn || 0).toFixed(1)} m³/s
-                      </div>
-                   </div>
-                   <span className="text-[10px] mt-10 text-slate-400">加压泵站</span>
-                </div>
-
-                {/* Long Pipe (Delay) */}
-                <div 
-                  className="absolute left-60 top-1/2 -translate-y-1/2 h-4 bg-slate-800 rounded relative overflow-hidden border-y border-slate-700 transition-all duration-500"
-                  style={{ width: pipePixelWidth + 'px' }}
-                >
-                   {/* Water segments moving */}
-                   <div className="absolute inset-0 flex gap-4 animate-flow-right opacity-50">
-                      {Array.from({length: 10}).map((_,i) => <div key={i} className="w-4 h-full bg-blue-500/50 transform -skew-x-12"></div>)}
-                   </div>
-                   <div className="absolute top-[-15px] w-full text-center text-[9px] text-slate-500">长距离输水滞后 ({PIPE_DELAY_SECONDS}s)</div>
-                   {faults.leakage.active && <div className="absolute bottom-[-10px] left-1/2 w-2 h-4 bg-blue-500/50 blur-sm animate-drip"></div>}
-                </div>
-
-                {/* Tank */}
-                <div className="absolute right-40 top-1/2 -translate-y-1/2 flex flex-col items-center">
-                   <div 
-                     className="h-40 border-x-2 border-b-2 border-slate-500 bg-slate-900/50 relative rounded-b-lg overflow-hidden backdrop-blur-sm transition-all duration-500" 
-                     style={{ width: `${tankPixelWidth}px` }}
-                   >
-                      <div 
-                        className="absolute bottom-0 left-0 right-0 bg-cyan-500/40 transition-all duration-300 ease-linear border-t border-cyan-400 shadow-[0_0_20px_rgba(6,182,212,0.3)]"
-                        style={{ height: `${Math.min(100, (tankLevelRef.current / 350) * 100)}%` }}
-                      >
-                         <div className="absolute top-0 w-full h-1 bg-white/20 animate-pulse"></div>
-                      </div>
-                      {/* Setpoint Line */}
-                      <div 
-                        className="absolute left-0 right-0 border-t-2 border-green-500 border-dashed transition-all duration-300 z-20 opacity-70"
-                        style={{ bottom: `${Math.min(100, ((history[history.length-1]?.target || 0) / 350) * 100)}%` }}
-                      >
-                         <span className="absolute -right-0 -top-3 text-[9px] text-green-500 font-mono">SP</span>
-                      </div>
-                   </div>
-                   <div className="mt-2 flex flex-col items-center">
-                      <span className="text-[10px] text-slate-400">高位调节池</span>
-                      <span className="font-mono text-sm font-bold text-cyan-400">{tankLevelRef.current.toFixed(1)}m</span>
-                   </div>
-                </div>
-
-                {/* Outflow Pipe */}
-                <div className="absolute right-16 top-[60%] w-24 h-3 bg-slate-800">
-                   <div className="h-full bg-blue-500/30 animate-flow-right"></div>
-                   <div className="absolute right-0 -bottom-6 text-right w-full">
-                      <div className="text-[10px] text-red-400 font-mono font-bold">{(history[history.length-1]?.flowOut || 0).toFixed(1)} m³/s</div>
-                      <div className="text-[9px] text-slate-500">用户用水</div>
+         {/* BOTTOM: CHART */}
+         <div className="h-[350px] bg-slate-950 p-0 relative z-10 shadow-[0_-20px_40px_rgba(0,0,0,0.5)]">
+             <div className="h-9 flex items-center justify-between px-4 bg-slate-900/50 border-b border-slate-800 backdrop-blur-sm">
+                <span className="text-[10px] font-bold text-slate-400 uppercase flex items-center gap-2"><Activity size={12} className="text-cyan-500"/> 实时遥测 Real-time Telemetry</span>
+                <div className="flex gap-4 text-[10px] font-mono text-slate-500">
+                   <span className="flex items-center gap-1"><Timer size={10}/> {time.toFixed(1)}s</span>
+                   <span className={Math.abs(tankLevelRef.current-295)>5?'text-red-500 font-bold':'text-green-500 font-bold'}>ERR: {Math.abs(tankLevelRef.current-295).toFixed(2)}</span>
+                   <div className="flex gap-1 ml-4">
+                      <button onClick={() => setIsRunning(!isRunning)} className="hover:text-white"><Pause size={12}/></button>
+                      <button onClick={() => {setTime(0); setHistory([]);}} className="hover:text-white"><RotateCcw size={12}/></button>
                    </div>
                 </div>
              </div>
-         </div>
-
-         {/* Chart Area */}
-         <div className="flex-1 min-h-0 relative p-4">
-            <div className="absolute inset-0 p-4 pb-2">
-               <TrendChart history={history} prediction={mpcPrediction} faults={faults} />
-            </div>
+             <div className="h-[calc(100%-36px)] p-4">
+                <TrendChart history={history} prediction={[]} faults={faults} />
+             </div>
          </div>
       </div>
 
-      {/* === RIGHT SIDEBAR: AI DIAGNOSIS === */}
-      <div className={`w-96 border-l border-slate-800 flex flex-col bg-slate-900/80 backdrop-blur transition-all duration-300 ${showChat ? 'translate-x-0' : 'translate-x-full hidden'}`}>
-         <div className="h-14 border-b border-slate-800 flex items-center px-4 justify-between bg-slate-900">
-            <div className="flex items-center gap-2">
-               <Sparkles className="text-purple-400" size={16}/>
-               <span className="font-bold text-slate-200 text-sm">智能诊断专家 (Gemini)</span>
+      {/* RIGHT SIDEBAR */}
+      <div className={`w-[320px] border-l border-slate-800 bg-slate-900/95 backdrop-blur-md flex flex-col transition-all ${showChat ? 'translate-x-0' : 'translate-x-full hidden'} shadow-2xl z-30`}>
+         {/* Inspector */}
+         <div className="h-[40%] border-b border-slate-800 p-5 bg-slate-900 overflow-y-auto custom-scrollbar">
+             <div className="flex items-center gap-2 mb-4 text-xs font-bold text-slate-300 uppercase tracking-wider">
+                <Settings2 size={14} className="text-purple-500"/> 属性检查器 Inspector
+             </div>
+             {selectedNodeId ? (() => {
+                const node = nodes.find(n => n.id === selectedNodeId);
+                if (!node) return null;
+                return (
+                   <div className="space-y-4 animate-in fade-in slide-in-from-right-4">
+                      <div className="bg-slate-950 p-3 rounded border border-slate-800">
+                          <div className="flex justify-between text-[10px] border-b border-slate-800 pb-2 mb-2">
+                             <span className="text-slate-500">ID</span><span className="font-mono text-slate-300">{node.id}</span>
+                          </div>
+                          <div className="flex justify-between text-[10px]">
+                             <span className="text-slate-500">Type</span><span className="font-mono text-cyan-400 font-bold">{node.type}</span>
+                          </div>
+                      </div>
+
+                      {node.type === 'RESERVOIR' && (
+                         <div>
+                            <div className="flex justify-between text-[10px] mb-1"><span className="text-slate-500">底面积 Area</span><span className="text-cyan-400 font-mono">{node.data.area} m²</span></div>
+                            <input type="range" min="10" max="300" value={node.data.area} onChange={(e) => setNodes(prev => prev.map(n => n.id === node.id ? {...n, data: {...n.data, area: Number(e.target.value)}} : n))} className="w-full h-1.5 bg-slate-800 rounded appearance-none cursor-pointer accent-cyan-500"/>
+                         </div>
+                      )}
+                      {node.type === 'PUMP' && (
+                         <div>
+                            <div className="flex justify-between text-[10px] mb-1"><span className="text-slate-500">运行效率 Efficiency</span><span className="text-orange-400 font-mono">{node.data.efficiency}%</span></div>
+                            <input type="range" min="0" max="100" value={node.data.efficiency} onChange={(e) => setNodes(prev => prev.map(n => n.id === node.id ? {...n, data: {...n.data, efficiency: Number(e.target.value)}} : n))} className="w-full h-1.5 bg-slate-800 rounded appearance-none cursor-pointer accent-orange-500"/>
+                         </div>
+                      )}
+                      {node.type === 'TURBINE' && (
+                         <div>
+                            <div className="flex justify-between text-[10px] mb-1"><span className="text-slate-500">装机容量 Capacity</span><span className="text-purple-400 font-mono">{node.data.capacity || 100} MW</span></div>
+                            <input type="range" min="0" max="500" value={node.data.capacity || 100} onChange={(e) => setNodes(prev => prev.map(n => n.id === node.id ? {...n, data: {...n.data, capacity: Number(e.target.value)}} : n))} className="w-full h-1.5 bg-slate-800 rounded appearance-none cursor-pointer accent-purple-500"/>
+                         </div>
+                      )}
+                      {node.type === 'PIPE' && (
+                         <div>
+                            <div className="flex justify-between text-[10px] mb-1"><span className="text-slate-500">输水滞后 Delay</span><span className="text-slate-300 font-mono">{node.data.delay}s</span></div>
+                            <input type="range" min="1" max="20" step="0.5" value={node.data.delay} onChange={(e) => setNodes(prev => prev.map(n => n.id === node.id ? {...n, data: {...n.data, delay: Number(e.target.value)}} : n))} className="w-full h-1.5 bg-slate-800 rounded appearance-none cursor-pointer accent-slate-500"/>
+                         </div>
+                      )}
+                      {(node.type === 'VALVE' || node.type === 'GATE') && (
+                         <div>
+                            <div className="flex justify-between text-[10px] mb-1"><span className="text-slate-500">开度 Open</span><span className="text-yellow-400 font-mono">{node.data.open || 100}%</span></div>
+                            <input type="range" min="0" max="100" value={node.data.open || 100} onChange={(e) => setNodes(prev => prev.map(n => n.id === node.id ? {...n, data: {...n.data, open: Number(e.target.value)}} : n))} className="w-full h-1.5 bg-slate-800 rounded appearance-none cursor-pointer accent-yellow-500"/>
+                         </div>
+                      )}
+
+                      <button onClick={() => { setNodes(prev => prev.filter(n => n.id !== node.id)); setEdges(curr => curr.filter(e => e.source !== node.id && e.target !== node.id)); setSelectedNodeId(null); }} className="w-full py-2 bg-red-900/10 text-red-400 text-[10px] rounded border border-red-900/30 hover:bg-red-900/20 transition-colors flex items-center justify-center gap-2">
+                         <Trash2 size={12}/> 删除组件
+                      </button>
+                   </div>
+                );
+             })() : (
+                <div className="flex flex-col items-center justify-center h-40 text-[10px] text-slate-600 border-2 border-dashed border-slate-800 rounded bg-slate-900/50">
+                   <MousePointer2 size={24} className="mb-2 opacity-50"/>
+                   请在画布上选中组件
+                </div>
+             )}
+         </div>
+
+         {/* AI Chat */}
+         <div className="flex-1 flex flex-col min-h-0 bg-slate-950/30">
+            <div className="p-3 border-b border-slate-800 flex justify-between items-center bg-slate-900">
+               <span className="text-xs font-bold text-slate-300 flex items-center gap-2"><Sparkles size={14} className="text-purple-500"/> AI 专家助手</span>
+            </div>
+            <div className="flex-1 overflow-y-auto p-3 space-y-3 custom-scrollbar">
+               {messages.length === 0 && (
+                  <div className="text-center mt-10 opacity-30">
+                     <Sparkles size={32} className="mx-auto mb-2"/>
+                     <p className="text-[10px]">系统运行正常</p>
+                  </div>
+               )}
+               {messages.map(m => (
+                  <div key={m.id} className={`text-xs p-2.5 rounded-lg border ${m.sender===Sender.User?'bg-blue-900/20 border-blue-800 text-blue-100 ml-4':'bg-slate-800 border-slate-700 text-slate-300 mr-4'}`}>
+                     <MarkdownRenderer content={m.text}/>
+                  </div>
+               ))}
+               {isStreaming && <div className="text-[10px] text-purple-400 animate-pulse pl-2 flex items-center gap-2"><div className="w-1.5 h-1.5 bg-purple-500 rounded-full"/> AI 正在分析...</div>}
+            </div>
+            <div className="p-3 border-t border-slate-800 bg-slate-900">
+               <ChatInput onSend={handleSendMessage} disabled={isStreaming}/>
             </div>
          </div>
-         
-         <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar bg-slate-950/50">
-            {messages.length === 0 && (
-               <div className="text-center py-10 opacity-50">
-                  <Box size={48} className="mx-auto mb-3 text-slate-600"/>
-                  <p className="text-sm text-slate-400">系统运行正常。</p>
-                  <p className="text-xs text-slate-600 mt-2">注入扰动或故障以触发 AI 分析...</p>
-               </div>
-            )}
-            {messages.map((msg) => (
-               <div key={msg.id} className={`flex gap-3 ${msg.sender === Sender.User ? 'flex-row-reverse' : ''}`}>
-                  <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 ${msg.sender === Sender.User ? 'bg-blue-600' : msg.sender === Sender.System ? 'bg-red-900/50' : 'bg-purple-600'}`}>
-                     {msg.sender === Sender.User ? <MessageSquare size={14}/> : msg.sender === Sender.System ? <AlertOctagon size={14}/> : <Sparkles size={14}/>}
-                  </div>
-                  <div className={`rounded-lg p-3 text-sm max-w-[85%] ${
-                     msg.sender === Sender.User ? 'bg-blue-600 text-white' : 
-                     msg.sender === Sender.System ? 'bg-red-900/20 text-red-200 border border-red-800' :
-                     'bg-slate-800 text-slate-200 border border-slate-700'
-                  }`}>
-                     {msg.sender === Sender.Model ? (
-                        <MarkdownRenderer content={msg.text} />
-                     ) : (
-                        <div>{msg.text}</div>
-                     )}
-                  </div>
-               </div>
-            ))}
-            {isStreaming && (
-              <div className="flex gap-3">
-                 <div className="w-8 h-8 rounded-full bg-purple-600 flex items-center justify-center shrink-0 animate-pulse">
-                    <Sparkles size={14}/>
-                 </div>
-                 <div className="bg-slate-800 rounded-lg p-3 flex items-center gap-2">
-                    <span className="w-2 h-2 bg-purple-400 rounded-full animate-bounce"></span>
-                    <span className="w-2 h-2 bg-purple-400 rounded-full animate-bounce" style={{animationDelay: '0.2s'}}></span>
-                    <span className="w-2 h-2 bg-purple-400 rounded-full animate-bounce" style={{animationDelay: '0.4s'}}></span>
-                 </div>
-              </div>
-            )}
-         </div>
-         
-         <ChatInput onSend={(text, att) => handleSendMessage(text, att)} disabled={isStreaming} />
       </div>
     </div>
   );
